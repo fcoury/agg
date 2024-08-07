@@ -1,0 +1,1987 @@
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/lib.rs>>
+pub mod api;
+pub mod jobs;
+pub mod migration;
+pub mod scan;
+pub mod server;
+pub mod utils;
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/lib.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/server.rs>>
+use std::{net::SocketAddr, path::PathBuf};
+
+use axum::{
+    extract::DefaultBodyLimit,
+    http::{header, Uri},
+    response::IntoResponse,
+    Router,
+};
+use sqlx::{Pool, Postgres};
+use tower_http::trace::TraceLayer;
+
+use crate::api;
+
+const MAX_BODY_SIZE: usize = 50 * 1024 * 1024; // 50 MB
+
+pub async fn start(pool: Pool<Postgres>, addr: SocketAddr) -> anyhow::Result<()> {
+    println!("Listening on {}...", addr);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    let api_router = api::routes(&pool);
+
+    let router = Router::new()
+        .nest("/api", api_router)
+        .fallback(spa_handler)
+        .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(MAX_BODY_SIZE));
+
+    axum::serve(listener, router).await?;
+    Ok(())
+}
+
+async fn spa_handler(uri: Uri) -> impl IntoResponse {
+    let path = uri.path().trim_start_matches('/').to_string();
+    let path = if path.is_empty() {
+        "index.html".to_string()
+    } else {
+        path
+    };
+    let path = PathBuf::from("static").join(path);
+
+    if path.exists() {
+        let content_type = mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .to_string();
+        (
+            [(header::CONTENT_TYPE, content_type)],
+            tokio::fs::read(path).await.unwrap(),
+        )
+    } else {
+        (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8".to_string())],
+            tokio::fs::read("static/index.html").await.unwrap(),
+        )
+    }
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/server.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/scan/textract.rs>>
+use std::{collections::HashMap, env};
+
+use anyhow::Context;
+use aws_config::{BehaviorVersion, Region};
+use aws_sdk_textract::{
+    config::Credentials,
+    primitives::Blob,
+    types::{Block, BlockType, Document, EntityType, RelationshipType},
+};
+use base64::{engine::general_purpose, Engine};
+use serde::Serialize;
+use serde_json::Value;
+use tracing::info;
+
+#[derive(Debug, Serialize)]
+struct KeyValuePair {
+    key: String,
+    value: String,
+    key_bounding_box: Option<BoundingBox>,
+    value_bounding_box: Option<BoundingBox>,
+    key_accuracy: f32,
+    value_accuracy: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BoundingBox {
+    width: f32,
+    height: f32,
+    left: f32,
+    top: f32,
+}
+
+pub async fn bounding_boxes(image: &str) -> anyhow::Result<Value> {
+    let bytes = general_purpose::STANDARD
+        .decode(image)
+        .with_context(|| "invalid base64 image")?;
+    let document = Document::builder().bytes(Blob::new(bytes)).build();
+    let resp = textract_client()
+        .await
+        .with_context(|| "failed to create bounding boxes analysis")?
+        .analyze_document()
+        .feature_types("FORMS".into())
+        .document(document)
+        .send()
+        .await
+        .context("failed to analyze document")?;
+
+    info!("response: {:?}", resp);
+    let blocks = resp.blocks();
+    let mut key_value_pairs = extract_key_value_pairs(blocks);
+
+    sort_key_value_pairs(&mut key_value_pairs);
+
+    Ok(serde_json::to_value(key_value_pairs)?)
+}
+
+async fn textract_client() -> anyhow::Result<aws_sdk_textract::Client> {
+    let credentials = Credentials::new(
+        env::var("AWS_ACCESS_KEY_ID")?,
+        env::var("AWS_SECRET_ACCESS_KEY")?,
+        None,
+        None,
+        "EncryptedStore",
+    );
+
+    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        .region(Region::new(env::var("AWS_REGION")?))
+        .credentials_provider(credentials)
+        .load()
+        .await;
+
+    Ok(aws_sdk_textract::Client::new(&config))
+}
+
+fn extract_key_value_pairs(blocks: &[Block]) -> Vec<KeyValuePair> {
+    let mut key_map = HashMap::new();
+    let mut value_map = HashMap::new();
+    let mut block_map = HashMap::new();
+
+    for block in blocks {
+        if let Some(block_id) = block.id() {
+            block_map.insert(block_id.to_string(), block);
+
+            if block.block_type() == Some(&BlockType::KeyValueSet) {
+                if block.entity_types().contains(&EntityType::Key) {
+                    key_map.insert(block_id.to_string(), block);
+                } else {
+                    value_map.insert(block_id.to_string(), block);
+                }
+            }
+        }
+    }
+
+    let mut key_value_pairs = Vec::new();
+
+    for (_, key_block) in key_map {
+        let key_text = get_text_for_block(key_block, &block_map);
+        let key_bounding_box = key_block
+            .geometry()
+            .and_then(|g| g.bounding_box())
+            .map(|bb| BoundingBox {
+                width: bb.width(),
+                height: bb.height(),
+                left: bb.left(),
+                top: bb.top(),
+            });
+        let key_accuracy = key_block.confidence().unwrap_or(0.0);
+
+        let relationships = key_block.relationships();
+        for relationship in relationships {
+            if relationship.r#type() == Some(&RelationshipType::Value) {
+                for value_block_id in relationship.ids() {
+                    if let Some(value_block) = value_map.get(value_block_id) {
+                        let value_text = get_text_for_block(value_block, &block_map);
+                        let value_bounding_box = value_block
+                            .geometry()
+                            .and_then(|g| g.bounding_box())
+                            .map(|bb| BoundingBox {
+                                width: bb.width(),
+                                height: bb.height(),
+                                left: bb.left(),
+                                top: bb.top(),
+                            });
+                        let value_accuracy = value_block.confidence().unwrap_or(0.0);
+
+                        key_value_pairs.push(KeyValuePair {
+                            key: key_text.clone(),
+                            value: value_text,
+                            key_bounding_box: key_bounding_box.clone(),
+                            value_bounding_box,
+                            key_accuracy,
+                            value_accuracy,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    key_value_pairs
+}
+
+fn sort_key_value_pairs(key_value_pairs: &mut Vec<KeyValuePair>) {
+    key_value_pairs.sort_by(|a, b| {
+        let a_box = a
+            .key_bounding_box
+            .as_ref()
+            .or(a.value_bounding_box.as_ref());
+        let b_box = b
+            .key_bounding_box
+            .as_ref()
+            .or(b.value_bounding_box.as_ref());
+
+        match (a_box, b_box) {
+            (Some(a), Some(b)) => a
+                .top
+                .partial_cmp(&b.top)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    a.left
+                        .partial_cmp(&b.left)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+}
+
+fn get_text_for_block(block: &Block, block_map: &HashMap<String, &Block>) -> String {
+    let mut text = String::new();
+
+    let relationships = block.relationships();
+    for relationship in relationships {
+        if relationship.r#type() == Some(&RelationshipType::Child) {
+            for child_id in relationship.ids() {
+                if let Some(word_block) = block_map.get(child_id) {
+                    if word_block.block_type() == Some(&BlockType::Word) {
+                        if let Some(word_text) = word_block.text() {
+                            text.push_str(word_text);
+                            text.push(' ');
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    text.trim().to_string()
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/scan/textract.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/scan/bedrock.rs>>
+use std::io::Write;
+use std::{collections::HashMap, env};
+
+use aws_config::BehaviorVersion;
+use aws_sdk_bedrockruntime::{
+    config::{Credentials, Region},
+    primitives::Blob,
+    types::ResponseStream,
+    Client,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::utils::{print_truncated_json, truncate_strings};
+
+const ANTHROPIC_VERSION: &str = "bedrock-2023-05-31";
+const MAX_TOKENS: u64 = 8192;
+const MODEL_ID: &str = "anthropic.claude-3-5-sonnet-20240620-v1:0";
+
+#[derive(Serialize, Debug)]
+pub struct Request {
+    pub anthropic_version: String,
+    pub max_tokens: u64,
+    pub messages: Vec<Message>,
+}
+
+impl Request {
+    pub fn new(text: &str) -> Self {
+        Request {
+            anthropic_version: ANTHROPIC_VERSION.to_string(),
+            max_tokens: MAX_TOKENS,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: vec![MessageContent::Text {
+                    typ: "text".to_string(),
+                    text: text.to_string(),
+                }],
+            }],
+        }
+    }
+
+    pub fn add_image(&mut self, image: &str) {
+        self.messages
+            .get_mut(0)
+            .unwrap()
+            .content
+            .push(MessageContent::Image {
+                typ: "image".to_string(),
+                source: ImageSource {
+                    typ: "base64".to_string(),
+                    media_type: "image/jpeg".to_string(),
+                    data: image.to_string(),
+                },
+            });
+    }
+}
+
+#[derive(Serialize, Debug)]
+pub struct Message {
+    pub role: String,
+    pub content: Vec<MessageContent>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Image {
+        #[serde(rename = "type")]
+        typ: String,
+        source: ImageSource,
+    },
+    Text {
+        #[serde(rename = "type")]
+        typ: String,
+        text: String,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ImageSource {
+    #[serde(rename = "type")]
+    pub typ: String,
+    pub media_type: String,
+    pub data: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct Response {
+    pub id: String,
+    pub role: String,
+    #[serde(rename = "type")]
+    pub typ: String,
+    pub model: String,
+    pub usage: Usage,
+    pub content: Vec<MessageContent>,
+    pub stop_reason: String,
+    pub stop_sequence: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RecognitionResult {
+    pub text: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+pub async fn recognize(
+    typ: &str,
+    image: &str,
+    attributes: &HashMap<String, String>,
+) -> anyhow::Result<RecognitionResult> {
+    let mut prompt = typ.to_string();
+    for (key, value) in attributes.iter() {
+        prompt = prompt.replace(&format!("{{{key}}}"), value);
+    }
+    println!("Prompt: {}", prompt);
+    let mut request = Request::new(&prompt);
+    request.add_image(image);
+
+    print_truncated_json(&serde_json::to_value(&request)?);
+    let body = serde_json::to_string(&request)?;
+    let body = Blob::new(body);
+    let response = bedrock_client()
+        .await?
+        .invoke_model_with_response_stream()
+        .body(body)
+        .model_id(MODEL_ID)
+        .content_type("application/json")
+        .accept("application/json")
+        .customize()
+        .mutate_request(|req| {
+            req.headers_mut()
+                .insert("anthropic-beta", "max-tokens-3-5-sonnet-2024-07-15");
+        })
+        .send()
+        .await?;
+
+    let mut full_response = String::new();
+    let mut input_tokens = 0;
+    let mut output_tokens = 0;
+    let mut stream = response.body;
+
+    while let Ok(Some(event)) = stream.recv().await {
+        match event {
+            ResponseStream::Chunk(chunk) => {
+                let blob = chunk.bytes().unwrap();
+                let payload: Value = serde_json::from_slice(blob.as_ref())?;
+
+                // Object {"delta": Object {"text": String("614"), "type": String("text_delta")},
+                // "index": Number(0), "type": String("content_block_delta")
+                if payload.is_object() {
+                    if payload["delta"].is_object() {
+                        let delta = payload["delta"].as_object().unwrap();
+                        if let Some(text) = delta.get("text") {
+                            let text = text.as_str().unwrap();
+                            full_response.push_str(text);
+                            print!("{}", text);
+                            std::io::stdout().flush()?;
+                            continue;
+                        }
+                    }
+                    if payload["type"].is_string() {
+                        let typ = payload["type"].as_str().unwrap();
+                        match typ {
+                            "message_stop" => {
+                                // {
+                                //   "amazon-bedrock-invocationMetrics": {
+                                //     "firstByteLatency": 2784,
+                                //     "inputTokenCount": 17238,
+                                //     "invocationLatency": 104085,
+                                //     "outputTokenCount": 2819
+                                //   },
+                                //   "type": "message_stop"
+                                // }
+                                output_tokens = payload["amazon-bedrock-invocationMetrics"]
+                                    ["outputTokenCount"]
+                                    .as_u64()
+                                    .unwrap();
+                                input_tokens = payload["amazon-bedrock-invocationMetrics"]
+                                    ["inputTokenCount"]
+                                    .as_u64()
+                                    .unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                println!("\n\n{}", serde_json::to_string_pretty(&payload)?);
+            }
+            e => {
+                tracing::error!(
+                    "Unhandled event handling streaming response from bedrock: {:?}",
+                    e
+                );
+            }
+        }
+    }
+
+    println!("\nFULL RESPONSE: {}", full_response);
+
+    let response = RecognitionResult {
+        text: full_response,
+        input_tokens,
+        output_tokens,
+    };
+
+    println!(
+        "Response: {:?}",
+        truncate_strings(&serde_json::to_value(response.clone())?)
+    );
+    Ok(response)
+}
+
+async fn bedrock_client() -> anyhow::Result<Client> {
+    let credentials = Credentials::new(
+        env::var("AWS_ACCESS_KEY_ID")?,
+        env::var("AWS_SECRET_ACCESS_KEY")?,
+        None,
+        None,
+        "EncryptedStore",
+    );
+
+    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        .region(Region::new(env::var("AWS_REGION")?))
+        .credentials_provider(credentials)
+        .load()
+        .await;
+
+    Ok(aws_sdk_bedrockruntime::Client::new(&config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_request_serialize() {
+        let mut request = Request::new("Hello, world!");
+        request.add_image("data:image/jpeg;base64,...");
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"anthropic_version":"bedrock-2023-05-31","max_tokens":8192,"messages":[{"role":"user","content":[{"type":"text","text":"Hello, world!"},{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"data:image/jpeg;base64,..."}}]}]}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_response_serialize() {
+        let json = include_str!("response.json");
+        let _: Response = serde_json::from_str(json).unwrap();
+    }
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/scan/bedrock.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/scan/mod.rs>>
+mod bedrock;
+mod textract;
+
+use std::collections::HashMap;
+
+use anyhow::Context;
+use bedrock::recognize;
+use paperiq_types::FormData;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::{Pool, Postgres, Row};
+use textract::bounding_boxes;
+
+use crate::utils::resize_jpg_base64;
+
+const PROMPTS: &[(&str, &str)] = &[
+    ("scan", include_str!("prompts/scan.txt")),
+    ("form", include_str!("prompts/form.txt")),
+];
+
+const INPUT_TOKEN_COST: f64 = 3.0 / 1_000_000.0; // $3 / MTok
+const OUTPUT_TOKEN_COST: f64 = 15.0 / 1_000_000.0; // $15 / MTok
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ScanRequestId(pub i32);
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct UserId(pub i32);
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct FormId(pub i32);
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ScanRequest {
+    id: ScanRequestId,
+    user_id: UserId,
+    form_id: Option<FormId>,
+    typ: String,
+    images: Vec<String>,
+    file_names: Vec<String>,
+}
+
+impl ScanRequest {
+    pub async fn create(
+        db: &Pool<Postgres>,
+        user_id: UserId,
+        form_id: Option<FormId>,
+        typ: String,
+        images: Vec<String>,
+        file_names: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let row: (i32,) = sqlx::query_as(
+            "INSERT INTO requests (user_id, form_id, type, images, file_names) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        )
+        .bind(user_id.0)
+        .bind(form_id.clone().map(|id| id.0))
+        .bind(&typ)
+        .bind(&images)
+        .bind(&file_names)
+        .fetch_one(db)
+        .await?;
+
+        Ok(Self {
+            id: ScanRequestId(row.0),
+            user_id,
+            form_id,
+            typ,
+            images,
+            file_names,
+        })
+    }
+
+    pub fn id(&self) -> i32 {
+        self.id.0
+    }
+}
+
+pub async fn scan(db: &Pool<Postgres>, request: &ScanRequest) -> anyhow::Result<()> {
+    let prompt = PROMPTS
+        .iter()
+        .find(|(name, _)| name == &request.typ)
+        .map(|(_, prompt)| prompt)
+        .ok_or_else(|| anyhow::anyhow!("Invalid prompt: {}", request.typ))?
+        .to_string();
+    let image = request.images.first().unwrap();
+    let image = resize_jpg_base64(image)?;
+
+    let mut response: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut attributes = HashMap::new();
+    set_status(db, &request.id, 0, "processing").await?;
+
+    if prompt.contains("{textract_output}") {
+        let boxes = match bounding_boxes(&image).await {
+            Ok(boxes) => boxes,
+            Err(err) => {
+                set_error(db, &request.id, "boundaries recognition", &err.to_string()).await?;
+                return Err(anyhow::anyhow!("Failed to get bounding boxes: {}", err));
+            }
+        };
+
+        set_status(db, &request.id, 50, "processing").await?;
+
+        let textract_output =
+            serde_json::to_string(&boxes).context("failed to serialize textract output")?;
+        attributes.insert("textract_output".to_string(), textract_output);
+
+        response.insert("boxes".to_string(), boxes);
+    }
+
+    if prompt.contains("{expected_fields}") {
+        if let Some(form_id) = &request.form_id {
+            let form = format_form_data(db, &request.user_id, form_id).await?;
+            attributes.insert("expected_fields".to_string(), form);
+        }
+    }
+
+    let data = match recognize(&prompt, &image, &attributes).await {
+        Ok(data) => data,
+        Err(err) => {
+            set_error(db, &request.id, "data recognition", &err.to_string()).await?;
+            return Err(anyhow::anyhow!("Failed to recognize image: {}", err));
+        }
+    };
+
+    let input_tokens = data.input_tokens;
+    let output_tokens = data.output_tokens;
+
+    let data = if request.typ == "form" {
+        serde_json::from_str(&data.text).context("failed to parse form data")?
+    } else {
+        Value::String(data.text)
+    };
+
+    let cost: f64 =
+        (input_tokens as f64 * INPUT_TOKEN_COST) + (output_tokens as f64 * OUTPUT_TOKEN_COST);
+    println!("cost: {}", cost);
+
+    response.insert("data".to_string(), data.clone());
+    set_result(
+        db,
+        &request.id,
+        response.into(),
+        data,
+        input_tokens as i32,
+        output_tokens as i32,
+        cost,
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn format_form_data(
+    db: &Pool<Postgres>,
+    user_id: &UserId,
+    form_id: &FormId,
+) -> anyhow::Result<String> {
+    let form = get_form_data(db, user_id, form_id).await?;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Here's the list of fields you should expect to find on the form \"{}\":\n\n",
+        form.name
+    ));
+    for section in &form.sections {
+        out.push_str(&format!("{}:\n", section.section));
+        for field in &section.fields {
+            let options = match &field.options {
+                Some(options) => format!("(values: {})", options.join(", ")),
+                None => "".to_string(),
+            };
+            out.push_str(&format!(
+                "- {} ({}): {}{}\n",
+                field.name, field.label, field.typ, options
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
+async fn get_form_data(
+    db: &Pool<Postgres>,
+    user_id: &UserId,
+    form_id: &FormId,
+) -> anyhow::Result<FormData> {
+    let row = sqlx::query("SELECT data FROM requests WHERE user_id = $1 AND id = $2")
+        .bind(user_id.0)
+        .bind(form_id.0)
+        .fetch_one(db)
+        .await?;
+    let data: Value = row.get("data");
+    let data: FormData = serde_json::from_value(data)?;
+
+    Ok(data)
+}
+
+async fn set_status(
+    db: &Pool<Postgres>,
+    request_id: &ScanRequestId,
+    percentage: i32,
+    status: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE requests SET status = $1, percentage = $2 WHERE id = $3")
+        .bind(status)
+        .bind(percentage)
+        .bind(request_id.0)
+        .execute(db)
+        .await?;
+
+    Ok(())
+}
+
+async fn set_result(
+    db: &Pool<Postgres>,
+    request_id: &ScanRequestId,
+    response: Value,
+    data: Value,
+    input_tokens: i32,
+    output_tokens: i32,
+    cost: f64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE requests SET data = $1, response = $2, status = $3, input_tokens = $4, output_tokens = $5, cost = $6, percentage = 100 WHERE id = $7",
+    )
+    .bind(&data)
+    .bind(&response)
+    .bind("completed")
+    .bind(input_tokens)
+    .bind(output_tokens)
+    .bind(cost)
+    .bind(request_id.0)
+    .execute(db)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn set_error(
+    db: &Pool<Postgres>,
+    request_id: &ScanRequestId,
+    location: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let status = format!("failed at {}", location);
+    sqlx::query("UPDATE requests SET status = $1, error = $2, percentage = 100 WHERE id = $3")
+        .bind(status)
+        .bind(message)
+        .bind(request_id.0)
+        .execute(db)
+        .await?;
+
+    Ok(())
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/scan/mod.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/scan/prompts/recognize-complete.txt>>
+You are an AI assistant tasked with recognizing field names and their handwritten contents from a medical test requisition form filled out by a human. Your goal is to analyze the image of the form and extract the relevant information.
+
+You will be provided with two inputs:
+
+1. Image data of the medical test requisition.
+2. A JSON output from a preliminary OCR pass using Textract, which includes key-value pairs and bounding boxes for the recognized fields.
+
+Analyze both the image data and the Textract output carefully, identifying the field names and their corresponding handwritten contents. Pay close attention to the layout of the form and the handwriting styles.
+
+Your output should be a JSON document containing the following information for each field found on the document:
+1. field_name: The name of the field as it appears on the form
+2. field_value: The handwritten content of the field
+3. accuracy_score: A score from 0 to 100 indicating your confidence in the accuracy of the recognized content
+4. key_bounding_box: The field returned from Textract without any modification
+5. value_bounding_box: The value returned from Textract without any modification
+6. textract_value: The value recognized by Textract for this field (if available)
+7. textract_accuracy: The confidence score provided by Textract for this field (if available)
+
+Before providing the accuracy score for each field, consider the following factors:
+- Clarity of the handwriting
+- Potential ambiguities in letter or number shapes
+- Consistency with expected field content (e.g., numeric values for age, alphabetic characters for names)
+- Any smudges, overlaps, or other imperfections in the writing
+- Comparison with the Textract-recognized value and confidence score
+
+If a field is present on the form but left blank, include it in the output with an empty field_value and an appropriate accuracy_score.
+
+If you cannot read a field name or its contents with any confidence, use "Unknown" for the field_name or field_value as appropriate, and assign a low accuracy_score.
+
+List all fields present on the form in the JSON output, in the order they appear on the form, from top to bottom and left to right. Include empty fields with appropriate values.
+
+Ensure that your output is a valid JSON document with no extra text. Provide your complete JSON output without any additional explanations or text.
+
+Here's an example of how your output should be structured:
+
+{
+  "fields": [
+    {
+      "field_name": "Patient Name",
+      "field_value": "John Doe",
+      "accuracy_score": 95,
+      "textract_value": "John Doe",
+      "textract_accucary": 0.98
+    },
+    {
+      "field_name": "Date of Birth",
+      "field_value": "05/12/1980",
+      "accuracy_score": 90,
+      "textract_value": "05/12/1980",
+      "textract_accuracy": 0.95
+    },
+    {
+      "field_name": "Gender",
+      "field_value": "Male",
+      "accuracy_score": 100,
+      "textract_value": "Male",
+      "textract_accuracy": 1.0
+    },
+    {
+      "field_name": "Address",
+      "field_value": "",
+      "accuracy_score": 100,
+      "textract_value": "",
+      "textract_accuracy": null
+    },
+    {
+      "field_name": "Unknown",
+      "field_value": "Illegible content",
+      "accuracy_score": 10,
+      "textract_value": "Il1eg1ble c0ntent",
+      "textract_accuracy": 0.3
+    }
+  ]
+}
+
+And here's the information Textract identified:
+
+{TEXTRACT_OUTPUT}
+
+Provide your response containing only the JSON output, with no extra text or markup. Ensure that your output is valid JSON and follows the structure shown in the example above, including all fields from the form even if they are empty.
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/scan/prompts/recognize-complete.txt>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/scan/prompts/recognize-no-textract.txt>>
+You are an AI assistant tasked with recognizing field names and their handwritten contents from a medical test requisition form filled out by a human. Your goal is to analyze the image of the form and extract the relevant information.
+
+You will be provided with image data of the medical test requisition.
+
+Analyze the image data, identifying the field names and their corresponding handwritten contents. Pay close attention to the layout of the form and the handwriting styles.
+
+Your output should be a JSON document containing the following information for each field found on the document:
+1. field_name: The name of the field as it appears on the form
+2. field_value: The handwritten content of the field
+3. accuracy_score: A score from 0 to 100 indicating your confidence in the accuracy of the recognized content
+
+Before providing the accuracy score for each field, consider the following factors:
+- Clarity of the handwriting
+- Potential ambiguities in letter or number shapes
+- Consistency with expected field content (e.g., numeric values for age, alphabetic characters for names)
+- Any smudges, overlaps, or other imperfections in the writing
+
+If a field is present on the form but left blank, include it in the output with an empty field_value and an appropriate accuracy_score.
+
+If you cannot read a field name or its contents with any confidence, use "Unknown" for the field_name or field_value as appropriate, and assign a low accuracy_score.
+
+List all fields present on the form in the JSON output, in the order they appear on the form, from top to bottom and left to right. Include empty fields with appropriate values.
+
+Ensure that your output is a valid JSON document with no extra text. Provide your complete JSON output without any additional explanations or text.
+
+Here's an example of how your output should be structured:
+
+{
+  "fields": [
+    {
+      "field_name": "Patient Name",
+      "field_value": "John Doe",
+      "accuracy_score": 95
+    },
+    {
+      "field_name": "Date of Birth",
+      "field_value": "05/12/1980",
+      "accuracy_score": 90
+    },
+    {
+      "field_name": "Gender",
+      "field_value": "Male",
+      "accuracy_score": 100
+    },
+    {
+      "field_name": "Address",
+      "field_value": "",
+      "accuracy_score": 100
+    },
+    {
+      "field_name": "Unknown",
+      "field_value": "Illegible content",
+      "accuracy_score": 10
+    }
+  ]
+}
+
+Provide your response containing only the JSON output, with no extra text or markup. Ensure that your output is valid JSON and follows the structure shown in the example above, including all fields from the form even if they are empty.
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/scan/prompts/recognize-no-textract.txt>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/scan/prompts/form.txt>>
+You are an AI assistant tasked with analyzing a form template. Your goal is to recognize the fields on the form, determine their logical order, and identify the appropriate form element type for each field.
+
+You will be provided with an image of the blank form template. 
+
+Analyze the image data, identifying a general name for the form and identifying the field names, their layout, and any instructions or options provided for each field.
+
+Your output should be a JSON document containing an array of objects, with each object representing sections with fields on the form and including the following information:
+
+1. label: The name of the field as it appears on the form
+2. name: The logical name of the field (e.g., "first_name", "last_name", "email", "phone_number", "address", "date_of_birth"). If the label appears more than once on the form, use the logic described before to make them unique
+2. type: The appropriate HTML form element type (e.g., "text", "radio", "checkbox", "select", "textarea")
+3. options: An array of options for radio buttons, checkboxes, or select elements (if applicablee. The fields can be omitted if not applicable.
+
+Group this information by section.
+
+Consider the following factors when determining the field type and options:
+- The layout and grouping of fields on the form
+- Any instructions or hints provided near the field
+- The expected type of information for each field (e.g., date, name, address)
+- The presence of checkboxes, radio buttons, or dropdown-style options
+
+If you cannot determine a field name or its type with confidence, use "unknown" for the field_name or field_type as appropriate.
+
+List all fields present on the form template in the order they logically appear. If the form contain sections, order the sections from top to bottom and left to right. Do the same for fields within the section, or if the form doesn't have sections, keep the top to bottom, left to right order.
+
+Ensure that your output is valid JSON and follows the structure described above. Provide your complete output without any additional explanations or text.
+
+Here's an example of how your output should be structured:
+
+{
+  "name": "Patient Information Form",
+  "sections": [
+    {
+      "section": "Patient Information",
+      "fields": [
+        {
+          "label": "Patient Name",
+          "name": "patient_name",
+          "type": "text"
+        },
+        {
+          "label": "Date of Birth",
+          "name": "date_of_birth",
+          "type": "date"
+        },
+        {
+          "label": "Gender",
+          "name": "gender",
+          "type": "radio",
+          "options": ["Male", "Female", "Other"]
+        }
+      ]
+    }
+  ],
+}
+
+In case more than one field has the same label, you can differentiate them by either prepending a common name for the section (like below) or adding a number at the end of the field name. For example, "patient_name_1", "patient_name_2", etc.
+
+{
+  "name": "Patient Information Form",
+  "sections": [
+    {
+      "section": "Patient Information",
+      "fields": [
+        {
+          "label": "Last Name",
+          "name": "patient_last_name",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "section": "Provider Information",
+      "fields": [
+        {
+          "label": "Last Name",
+          "name": "provider_last_name",
+          "type": "text"
+        }
+      ]
+    }
+  ],
+}
+
+Provide your response containing only the JSON output, with no extra text or markup. Ensure that your output is valid JSON and follows the structure shown in the example above, including all fields from the form template.
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/scan/prompts/form.txt>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/scan/prompts/scan.txt>>
+You are an AI assistant tasked with recognizing field names and their handwritten contents from a medical test requisition form filled out by a human. Your goal is to analyze the image of the form and extract the relevant information.
+
+You will be provided with the inputs:
+
+1. Image data of the medical test requisition.
+2. A list of fields that are expected to be present on the form, in the order they appear from top to bottom and left to right.
+3. A JSON output from a preliminary OCR pass using Textract, which includes key-value pairs and bounding boxes for the recognized fields.
+
+Analyze both the image data and the Textract output carefully, identifying the field names and their corresponding handwritten contents. Pay close attention to the layout of the form and the handwriting styles.
+
+Your output should be one CSV line per field. Here's an example of how it should be structured:
+
+"patient_name", "John Doe", 95, 0.48727989196777344, 0.12345679014968872, 0.48727989196777344, 0.12345679014968872 
+"date_of_birth", "05/12/1980", 90, 0.48727989196777344, 0.12345679014968872, 0.48727989196777344, 0.123
+"gender", "Male", 100, 0.48727989196777344, 0.12345679014968872, 0.48727989196777344, 0.12345679014968872
+"address", "", 100, 0.48727989196777344, 0.12345679014968872, 0.48727989196777344, 0.12345679014968872
+
+Here is a description of each field:
+
+1. The name of the field as it appears on the form
+2. The handwritten content of the field
+3. A score from 0 to 100 indicating your confidence in the accuracy of the recognized content
+5. The value_bounding_box left value returned from Textract without any modification
+6. The value_bounding_box top value returned from Textract without any modification
+7. The value_bounding_box width value returned from Textract without any modification
+8. The value_bounding_box height value returned from Textract without any modification
+
+Before providing the accuracy score for each field, consider the following factors:
+- Clarity of the handwriting
+- Potential ambiguities in letter or number shapes
+- Consistency with expected field content (e.g., numeric values for age, alphabetic characters for names)
+- Any smudges, overlaps, or other imperfections in the writing
+- Comparison with the Textract-recognized value and confidence score
+
+If a field is present on the form but left blank, include it in the output with an empty field_value and an appropriate accuracy_score.
+
+List all fields present on the form in the output, in the order they appear on the form, from top to bottom and left to right. Include empty fields with appropriate values.
+
+{expected_fields}
+
+And here's the information Textract identified:
+
+{textract_output}
+
+Provide your response containing only the CSV lines, with no extra text or markup. Ensure that your output is valid CSV and follows the structure shown in the example above, including all fields from the form even if they are empty.
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/scan/prompts/scan.txt>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/scan/response.json>>
+{
+  "id": "msg_bdrk_0159VNinqSaRi1rwgC53b2GH",
+  "role": "assistant",
+  "type": "message",
+  "model": "claude-3-5-sonnet-20240620",
+  "usage": { "input_tokens": 16293, "output_tokens": 4095 },
+  "content": [
+    {
+      "text": "{\n  \"fields\": [\n    {\n      \"field_name\": \"Last Name\",\n      \"field_value\": \"Coury\",\n      \"accuracy_score\": 95,\n      \"key_bounding_box\": {\n        \"height\": 0.007310410030186176,\n        \"left\": 0.07470738887786865,\n        \"top\": 0.11152341216802597,\n        \"width\": 0.0451415590941906\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.02730696089565754,\n        \"left\": 0.0882273018360138,\n        \"top\": 0.094522625207901,\n        \"width\": 0.0793556496500969\n      },\n      \"textract_value\": \"Coury\",\n      \"textract_accuracy\": 80.0\n    },\n    {\n      \"field_name\": \"First\",\n      \"field_value\": \"Felipe\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.007675451226532459,\n        \"left\": 0.3680168092250824,\n        \"top\": 0.1126120537519455,\n        \"width\": 0.01924998126924038\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.029892416670918465,\n        \"left\": 0.3680168092250824,\n        \"top\": 0.09042897075414658,\n        \"width\": 0.08547217398881912\n      },\n      \"textract_value\": \"Felipe\",\n      \"textract_accuracy\": 79.39579010009766\n    },\n    {\n      \"field_name\": \"MI\",\n      \"field_value\": \"G\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.007866748608648777,\n        \"left\": 0.5621282458305359,\n        \"top\": 0.11302327364683151,\n        \"width\": 0.010908336378633976\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.013677298091351986,\n        \"left\": 0.5648038983345032,\n        \"top\": 0.09541136771440506,\n        \"width\": 0.02330390177667141\n      },\n      \"textract_value\": \"G\",\n      \"textract_accuracy\": 89.86429595947266\n    },\n    {\n      \"field_name\": \"Address\",\n      \"field_value\": \"17202 Collins Ave\",\n      \"accuracy_score\": 95,\n      \"key_bounding_box\": {\n        \"height\": 0.0074936393648386,\n        \"left\": 0.07489810138940811,\n        \"top\": 0.1345156729221344,\n        \"width\": 0.0335068441927433\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.01783614419400692,\n        \"left\": 0.09574442356824875,\n        \"top\": 0.11836425215005875,\n        \"width\": 0.24979373812675476\n      },\n      \"textract_value\": \"17202 Collins Ave\",\n      \"textract_accuracy\": 89.840576171875\n    },\n    {\n      \"field_name\": \"City\",\n      \"field_value\": \"Sunny Isles\",\n      \"accuracy_score\": 95,\n      \"key_bounding_box\": {\n        \"height\": 0.008012555539608002,\n        \"left\": 0.07398111373186111,\n        \"top\": 0.15862727165222168,\n        \"width\": 0.016006747260689735\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.035094574093818665,\n        \"left\": 0.10599033534526825,\n        \"top\": 0.13763315975666046,\n        \"width\": 0.1450590044260025\n      },\n      \"textract_value\": \"sunny Isles FL\",\n      \"textract_accuracy\": 77.00270080566406\n    },\n    {\n      \"field_name\": \"State\",\n      \"field_value\": \"FL\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.007883794605731964,\n        \"left\": 0.07405325770378113,\n        \"top\": 0.18238632380962372,\n        \"width\": 0.02212722785770893\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.017592931166291237,\n        \"left\": 0.11063035577535629,\n        \"top\": 0.16326862573623657,\n        \"width\": 0.04526181519031525\n      },\n      \"textract_value\": \"\",\n      \"textract_accuracy\": 77.88945770263672\n    },\n    {\n      \"field_name\": \"Zip\",\n      \"field_value\": \"33180\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.008901667781174183,\n        \"left\": 0.28101980686187744,\n        \"top\": 0.18342068791389465,\n        \"width\": 0.013987448997795582\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.02241652086377144,\n        \"left\": 0.2763526141643524,\n        \"top\": 0.15974144637584686,\n        \"width\": 0.06719420850276947\n      },\n      \"textract_value\": \"33180\",\n      \"textract_accuracy\": 92.0571060180664\n    },\n    {\n      \"field_name\": \"Birth Date\",\n      \"field_value\": \"12/12/1978\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.007025294937193394,\n        \"left\": 0.36809948086738586,\n        \"top\": 0.1357673853635788,\n        \"width\": 0.04101993143558502\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.03209570795297623,\n        \"left\": 0.3831063210964203,\n        \"top\": 0.11376259475946426,\n        \"width\": 0.14907695353031158\n      },\n      \"textract_value\": \"12/12/1978\",\n      \"textract_accuracy\": 90.19577026367188\n    },\n    {\n      \"field_name\": \"Sex\",\n      \"field_value\": \"M\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.007427684497088194,\n        \"left\": 0.6051029562950134,\n        \"top\": 0.13689211010932922,\n        \"width\": 0.00886520929634571\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.00875847227871418,\n        \"left\": 0.5878883600234985,\n        \"top\": 0.13637220859527588,\n        \"width\": 0.012506010942161083\n      },\n      \"textract_value\": \"\",\n      \"textract_accuracy\": 89.40545654296875\n    },\n    {\n      \"field_name\": \"SS\",\n      \"field_value\": \"846-12-1842\",\n      \"accuracy_score\": 95,\n      \"key_bounding_box\": {\n        \"height\": 0.007009977474808693,\n        \"left\": 0.36709722876548767,\n        \"top\": 0.15978094935417175,\n        \"width\": 0.011005767621099949\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.04313866049051285,\n        \"left\": 0.37409934401512146,\n        \"top\": 0.14077337086200714,\n        \"width\": 0.21311646699905396\n      },\n      \"textract_value\": \"846-12-1842 305-450-2983\",\n      \"textract_accuracy\": 63.6561393737793\n    },\n    {\n      \"field_name\": \"Home Phone\",\n      \"field_value\": \"305-450-2983\",\n      \"accuracy_score\": 95,\n      \"key_bounding_box\": {\n        \"height\": 0.007679033558815718,\n        \"left\": 0.36727696657180786,\n        \"top\": 0.18372419476509094,\n        \"width\": 0.05263408645987511\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.024037735536694527,\n        \"left\": 0.3820180296897888,\n        \"top\": 0.16007398068904877,\n        \"width\": 0.20604272186756134\n      },\n      \"textract_value\": \"\",\n      \"textract_accuracy\": 93.19984436035156\n    },\n    {\n      \"field_name\": \"Hospital/Physician Office Patient ID #\",\n      \"field_value\": \"41228673\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.0092620849609375,\n        \"left\": 0.07378669083118439,\n        \"top\": 0.20660482347011566,\n        \"width\": 0.15795664489269257\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.020984066650271416,\n        \"left\": 0.1158280074596405,\n        \"top\": 0.1852903962135315,\n        \"width\": 0.11104115098714828\n      },\n      \"textract_value\": \"41228673\",\n      \"textract_accuracy\": 93.70906066894531\n    },\n    {\n      \"field_name\": \"Accession #\",\n      \"field_value\": \"5620212204\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.007318517193198204,\n        \"left\": 0.36736220121383667,\n        \"top\": 0.20815646648406982,\n        \"width\": 0.05318664759397507\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.02084476128220558,\n        \"left\": 0.3752569854259491,\n        \"top\": 0.1913638859987259,\n        \"width\": 0.14361639320850372\n      },\n      \"textract_value\": \"5620212204\",\n      \"textract_accuracy\": 89.97354125976562\n    },\n    {\n      \"field_name\": \"Patient Status\",\n      \"field_value\": \"Inpatient\",\n      \"accuracy_score\": 95,\n      \"key_bounding_box\": {\n        \"height\": 0.00850486196577549,\n        \"left\": 0.18113015592098236,\n        \"top\": 0.2933045029640198,\n        \"width\": 0.03704633191227913\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.010315949097275734,\n        \"left\": 0.15813295543193817,\n        \"top\": 0.28899502754211426,\n        \"width\": 0.018283097073435783\n      },\n      \"textract_value\": \"\",\n      \"textract_accuracy\": 93.04011535644531\n    },\n    {\n      \"field_name\": \"Patient Hospital discharge date\",\n      \"field_value\": \"05/03/24\",\n      \"accuracy_score\": 95,\n      \"key_bounding_box\": {\n        \"height\": 0.009083539247512817,\n        \"left\": 0.3830958902835846,\n        \"top\": 0.29287758469581604,\n        \"width\": 0.13708028197288513\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.021081039682030678,\n        \"left\": 0.5241786241531372,\n        \"top\": 0.28895339369773865,\n        \"width\": 0.11507598310709\n      },\n      \"textract_value\": \"05/03/24\",\n      \"textract_accuracy\": 87.80813598632812\n    },\n    {\n      \"field_name\": \"Physician Name\",\n      \"field_value\": \"Rodney Williams\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.009063713252544403,\n        \"left\": 0.6677932739257812,\n        \"top\": 0.26408231258392334,\n        \"width\": 0.06748010218143463\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.02728513814508915,\n        \"left\": 0.6961678266525269,\n        \"top\": 0.2448340654373169,\n        \"width\": 0.2150421440601349\n      },\n      \"textract_value\": \"Rodney Williams\",\n      \"textract_accuracy\": 92.68092346191406\n    },\n    {\n      \"field_name\": \"Physician NPI#\",\n      \"field_value\": \"128309421\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.008899415843188763,\n        \"left\": 0.6678542494773865,\n        \"top\": 0.29381123185157776,\n        \"width\": 0.06635943800210953\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.01991012506186962,\n        \"left\": 0.6882220506668091,\n        \"top\": 0.2756083309650421,\n        \"width\": 0.16027270257472992\n      },\n      \"textract_value\": \"128309421\",\n      \"textract_accuracy\": 93.42805480957031\n    },\n    {\n      \"field_name\": \"Physician Phone\",\n      \"field_value\": \"786-331-9021\",\n      \"accuracy_score\": 98,\n      \"key_bounding_box\": {\n        \"height\": 0.009090767242014408,\n        \"left\": 0.6678963303565979,\n        \"top\": 0.32351747155189514,\n        \"width\": 0.06787285208702087\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.018301567062735558,\n        \"left\": 0.6923420429229736,\n        \"top\": 0.3023468255996704,\n        \"width\": 0.18999870121479034\n      },\n      \"textract_value\": \"786-331-9021\",\n      \"textract_accuracy\": 94.28636169433594\n    },\n    {\n      \"field_name\": \"Physician Email\",\n      \"field_value\": \"rodwil@aventuramd.com\",\n      \"accuracy_score\": 95,\n      \"key_bounding_box\": {\n        \"height\": 0.00914210919290781,\n        \"left\": 0.6674851179122925,\n        \"top\": 0.3530793786048889,\n        \"width\": 0.06500857323408127\n      },\n      \"value_bounding_box\": {\n        \"height\": 0.024705423042178154,\n        \"left\": 0.6822713613510132,\n        \"top\": 0.3326425552368164,\n        \"width\": 0.3108876347541809\n      },\n      \"textract_value\": \"rodwil@aventuramd.com\",\n      \"textract_accuracy\": 79.35391",
+      "type": "text"
+    }
+  ],
+  "stop_reason": "max_tokens",
+  "stop_sequence": null
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/scan/response.json>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/migration.rs>>
+use std::path::PathBuf;
+
+use apalis::{postgres::PostgresStorage, prelude::BoxDynError};
+use futures::future::BoxFuture;
+use sqlx::{
+    migrate::{Migration, MigrationSource, Migrator},
+    Pool, Postgres,
+};
+
+pub async fn run(pool: &Pool<Postgres>) -> anyhow::Result<()> {
+    let migrator = Migrator::new(&ApalisPlusPath(PathBuf::from("migrations"))).await?;
+    migrator.run(pool).await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+pub struct ApalisPlusPath(PathBuf);
+
+impl<'s> MigrationSource<'s> for &'s ApalisPlusPath {
+    fn resolve(self) -> BoxFuture<'s, Result<Vec<Migration>, BoxDynError>> {
+        Box::pin(async move {
+            let migrator = PostgresStorage::migrations();
+            let mut migrations = self.0.clone().resolve().await?;
+            migrations.extend(migrator.iter().cloned());
+
+            // ensure that we are sorted by `VERSION ASC`
+            migrations.sort_by_key(|m| m.version);
+
+            Ok(migrations)
+        })
+    }
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/migration.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/main.rs>>
+use std::env;
+
+use dotenv::dotenv;
+use paperiq::{jobs, migration, server};
+use sqlx::postgres::PgPoolOptions;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenv().ok();
+    setup_logging();
+
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let addr = env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("Failed to create pool");
+
+    migration::run(&pool).await?;
+
+    let task1 = tokio::spawn(jobs::start(pool.clone()));
+    let task2 = tokio::spawn(server::start(pool.clone(), addr.parse()?));
+
+    let (result1, result2) = tokio::try_join!(task1, task2)?;
+
+    result1?;
+    result2?;
+
+    Ok(())
+}
+
+pub fn setup_logging() {
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "paperiq=debug,tower_http=info".into()),
+        ))
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/main.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/api/auth.rs>>
+use std::{env, sync::Arc};
+
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
+
+use super::AppState;
+
+#[derive(Serialize, Deserialize)]
+pub struct Claims {
+    pub sub: String,
+    pub exp: usize,
+    pub email: String,
+}
+
+pub async fn auth(
+    State(state): State<Arc<AppState>>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, impl IntoResponse> {
+    if let Some(api_key) = request.headers().get("X-API-Key") {
+        let row = sqlx::query("SELECT user_id FROM api_keys WHERE key = $1")
+            .bind(
+                api_key
+                    .to_str()
+                    .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid API key".to_string()))?,
+            )
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Database error".to_string(),
+                )
+            })?
+            .ok_or((StatusCode::UNAUTHORIZED, "Invalid API key".to_string()))?;
+
+        let user_id = row.get::<i32, _>("user_id");
+        request.extensions_mut().insert(user_id);
+        return Ok(next.run(request).await);
+    }
+
+    let auth_header = request.headers().get("Authorization");
+    let Some(auth_header) = auth_header else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Missing authorization header".to_string(),
+        ));
+    };
+    let auth_header = auth_header.to_str().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Invalid authorization header".to_string(),
+        )
+    })?;
+    let token = auth_header.strip_prefix("Bearer ").ok_or((
+        StatusCode::BAD_REQUEST,
+        "Invalid authorization header".to_string(),
+    ))?;
+
+    let jwt_secret = env::var("JWT_SECRET").unwrap();
+    let token_data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(jwt_secret.as_ref()),
+        &Validation::new(Algorithm::HS256),
+    )
+    .map_err(|e| {
+        tracing::error!("Invalid token: {}", e);
+        (StatusCode::UNAUTHORIZED, format!("Invalid token"))
+    })?;
+
+    let user_id: i32 = token_data.claims.sub.parse().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid user ID in token".to_string(),
+        )
+    })?;
+    request.extensions_mut().insert(user_id);
+
+    Ok(next.run(request).await)
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/api/auth.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/api/mod.rs>>
+mod auth;
+mod login;
+mod settings;
+
+use apalis::postgres::PostgresStorage;
+use apalis::prelude::*;
+use axum::{
+    extract::{Extension, Path, Query, State},
+    http::StatusCode,
+    middleware::from_fn_with_state,
+    routing::{get, post},
+    Json, Router,
+};
+use chrono::NaiveDateTime;
+use csv::ReaderBuilder;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use sqlx::prelude::*;
+use sqlx::{Pool, Postgres};
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::scan::{FormId, ScanRequest, UserId};
+use auth::auth;
+use login::{login, register};
+pub use settings::{get_settings, update_setting};
+
+pub fn routes(db: &Pool<Postgres>) -> Router {
+    let db = db.clone();
+    let state = Arc::new(AppState { db });
+
+    Router::new()
+        .route("/user", get(user))
+        .route("/settings", get(get_settings))
+        .route("/settings/:key", post(update_setting))
+        .route("/generate_api_key", post(generate_api_key))
+        .route("/scan", post(scan))
+        .route("/scans", get(get_scans))
+        .route("/requests", get(get_requests))
+        .route("/requests/:id", get(get_request))
+        .route("/forms/:id/data", get(form_data))
+        .layer(from_fn_with_state(state.clone(), auth))
+        .route("/login", post(login))
+        .route("/register", post(register))
+        .with_state(state)
+}
+
+#[derive(Serialize, Deserialize, FromRow)]
+pub struct User {
+    pub id: i32,
+    pub email: String,
+    pub password_hash: String,
+}
+
+#[derive(Serialize, Deserialize, FromRow)]
+pub struct PublicUser {
+    pub id: i32,
+    pub email: String,
+    pub settings: Value,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ApiKey {
+    key: String,
+    user_id: i32,
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Pool<Postgres>,
+}
+
+pub async fn user(
+    State(state): State<Arc<AppState>>,
+    Extension(user_id): Extension<i32>,
+) -> Result<Json<Option<PublicUser>>, (StatusCode, String)> {
+    let sql = r#"
+    SELECT 
+        u.id, 
+        u.email,
+        COALESCE(
+            jsonb_object_agg(s.key, s.value) FILTER (
+                WHERE s.key IS NOT NULL AND s.value IS NOT NULL
+            ), 
+            '{}'::jsonb
+        ) AS settings
+    FROM 
+        users u
+        LEFT JOIN settings s ON s.user_id = u.id
+    WHERE 
+        u.id = $1
+    GROUP BY 
+        u.id, u.email;
+    "#;
+    let user = sqlx::query_as::<_, PublicUser>(sql)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|err| {
+            tracing::error!("Could not fetch user: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not fetch user: {err}"),
+            )
+        })?;
+
+    Ok(Json(user))
+}
+
+pub async fn generate_api_key(
+    State(state): State<Arc<AppState>>,
+    Extension(user_id): Extension<i32>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let api_key = Uuid::new_v4().to_string();
+
+    sqlx::query("INSERT INTO api_keys (key, user_id) VALUES ($1, $2)")
+        .bind(&api_key)
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not generate API key".to_string(),
+            )
+        })?;
+
+    Ok(Json(api_key))
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UserScanRequest {
+    form_id: Option<i32>,
+    prompt: String,
+    images: Vec<String>,
+    file_names: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct UserScanResponse {
+    id: i32,
+}
+
+pub async fn scan(
+    State(state): State<Arc<AppState>>,
+    Extension(user_id): Extension<i32>,
+    Json(request): Json<UserScanRequest>,
+) -> Result<Json<UserScanResponse>, (StatusCode, String)> {
+    if request.images.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "At least one image is required".to_string(),
+        ));
+    }
+
+    let user_id = UserId(user_id);
+    let form_id = request.form_id.map(FormId);
+    let request = ScanRequest::create(
+        &state.db,
+        user_id,
+        form_id,
+        request.prompt,
+        request.images,
+        request.file_names,
+    )
+    .await
+    .map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not create request: {}", err),
+        )
+    })?;
+
+    let mut storage: PostgresStorage<ScanRequest> = PostgresStorage::new(state.db.clone());
+    storage.push(request.clone()).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not enqueue scan job".to_string(),
+        )
+    })?;
+
+    Ok(Json(UserScanResponse { id: request.id() }))
+}
+
+#[derive(FromRow, Serialize, Debug)]
+pub struct RequestData {
+    pub id: i32,
+    pub status: String,
+    pub percentage: i32,
+    pub error: Option<String>,
+    #[sqlx(rename = "type")]
+    #[serde(rename = "type")]
+    pub typ: String,
+    #[sqlx(default)]
+    pub images: Option<Vec<String>>,
+    pub file_names: Vec<String>,
+    pub response: Option<Value>,
+    pub data: Option<Value>,
+    pub created_at: chrono::NaiveDateTime,
+    pub modified_at: chrono::NaiveDateTime,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum Order {
+    #[serde(rename = "ASC")]
+    Asc,
+    #[serde(rename = "DESC")]
+    Desc,
+}
+
+impl ToString for Order {
+    fn to_string(&self) -> String {
+        match self {
+            Order::Asc => "ASC".to_string(),
+            Order::Desc => "DESC".to_string(),
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct RequestQuery {
+    pub limit: Option<i64>,
+    // pub offset: Option<i64>,
+    pub sort: Option<String>,
+    pub order: Option<Order>,
+    #[serde(rename = "type")]
+    pub typ: Option<String>,
+    pub omit_images: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ScanQuery {
+    #[serde(rename = "type")]
+    typ: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Limit {
+    limit: i64,
+    offset: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Sort {
+    column: String,
+    order: Order,
+}
+
+const REQUEST_COLUMNS: &str =
+    "id, status, percentage, error, type, images, file_names, response, data, created_at, modified_at";
+
+async fn get_scans(
+    State(state): State<Arc<AppState>>,
+    Extension(user_id): Extension<i32>,
+    sort: Option<Query<Sort>>,
+    filter: Option<Query<ScanQuery>>,
+) -> Result<Json<Vec<RequestData>>, (StatusCode, String)> {
+    let mut sql = format!("SELECT {REQUEST_COLUMNS} FROM requests WHERE user_id = $1");
+
+    if let Some(filter) = &filter {
+        if let Some(_) = filter.typ {
+            sql.push_str(" AND type = $2");
+        }
+    }
+
+    if let Some(sort) = sort {
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&sort.column);
+        sql.push(' ');
+        sql.push_str(&sort.order.to_string());
+    }
+
+    let mut query = sqlx::query_as(&sql).bind(user_id);
+
+    if let Some(filter) = &filter {
+        if let Some(typ) = &filter.typ {
+            query = query.bind(typ);
+        }
+    }
+
+    let requests: Vec<RequestData> = query.fetch_all(&state.db).await.map_err(|err| {
+        tracing::error!("Could not fetch scans: {}", err);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not fetch scans"),
+        )
+    })?;
+
+    Ok(Json(requests))
+}
+
+pub async fn get_requests(
+    State(state): State<Arc<AppState>>,
+    Extension(user_id): Extension<i32>,
+    query: Option<Query<RequestQuery>>,
+) -> Result<Json<Vec<RequestData>>, (StatusCode, String)> {
+    let mut columns = format!("{REQUEST_COLUMNS}");
+    if let Some(query) = &query {
+        if query.0.omit_images {
+            columns = columns.replace(", images", "");
+        }
+    }
+
+    let mut sql = format!("SELECT {columns} FROM requests WHERE user_id = $1");
+    let mut typ = None;
+
+    if let Some(query) = query {
+        let query = query.0;
+
+        if let Some(qtyp) = query.typ {
+            sql.push_str(" AND type = $2");
+            typ = Some(qtyp);
+        }
+
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&query.sort.unwrap_or("created_at".to_string()));
+        sql.push(' ');
+        sql.push_str(&query.order.unwrap_or(Order::Asc).to_string());
+        if let Some(limit) = query.limit {
+            sql.push_str(" LIMIT ");
+            sql.push_str(&limit.to_string());
+        }
+    }
+
+    let mut query_as = sqlx::query_as(&sql).bind(user_id);
+    if let Some(typ) = typ {
+        query_as = query_as.bind(typ);
+    }
+
+    let requests: Vec<RequestData> = query_as.fetch_all(&state.db).await.map_err(|err| {
+        tracing::error!("Could not fetch requests: {}", err);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not fetch requests"),
+        )
+    })?;
+
+    Ok(Json(requests))
+}
+
+async fn get_request(
+    State(state): State<Arc<AppState>>,
+    Extension(user_id): Extension<i32>,
+    Path(request_id): Path<u32>,
+) -> Result<Json<RequestData>, (StatusCode, String)> {
+    let response: RequestData = sqlx::query_as(&format!(
+        "SELECT {REQUEST_COLUMNS} FROM requests WHERE user_id = $1 AND id = $2"
+    ))
+    .bind(user_id)
+    .bind(request_id as i32)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not fetch request".to_string(),
+        )
+    })?;
+
+    Ok(Json(response))
+}
+
+pub async fn form_data(
+    State(state): State<Arc<AppState>>,
+    Extension(user_id): Extension<i32>,
+    Path(form_id): Path<i32>,
+) -> Result<Json<Vec<Value>>, (StatusCode, String)> {
+    let data: Vec<(i32, NaiveDateTime, Option<Value>)> = sqlx::query_as(
+        "SELECT id, created_at, data FROM requests WHERE user_id = $1 AND form_id = $2",
+    )
+    .bind(user_id)
+    .bind(form_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| {
+        tracing::error!("Could not fetch form data: {}", err);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not fetch form data: {err}"),
+        )
+    })?;
+
+    let mut res = vec![];
+    for (id, created_at, data) in data {
+        let Some(data) = data else {
+            res.push(Value::Null);
+            continue;
+        };
+        let Some(data) = data.as_str() else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Invalid form data: expected a string, got {data:?}"),
+            ));
+        };
+
+        let created_at = serde_json::to_value(&created_at).map_err(|err| {
+            tracing::error!("Could not serialize created_at: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not serialize created_at".to_string(),
+            )
+        })?;
+
+        let mut json = Map::new();
+        json.insert("_id".to_string(), id.into());
+        json.insert("_created_at".to_string(), created_at);
+
+        let mut rdr = ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(data.as_bytes());
+        for result in rdr.records() {
+            let result = result.map_err(|err| {
+                tracing::error!("Could not parse CSV record: {}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not parse CSV record".to_string(),
+                )
+            })?;
+
+            json.insert(result[0].to_string(), result[1].to_string().into());
+        }
+
+        let json = serde_json::to_value(&json).map_err(|err| {
+            tracing::error!("Could not serialize form data: {}", err);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not serialize form data".to_string(),
+            )
+        })?;
+
+        res.push(json);
+    }
+
+    Ok(Json(res))
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/api/mod.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/api/login.rs>>
+use std::{env, sync::Arc};
+
+use axum::{extract::State, http::StatusCode, Json};
+use bcrypt::{hash, verify};
+use chrono::{Duration, Utc};
+use jsonwebtoken::{encode, EncodingKey, Header};
+use serde::{Deserialize, Serialize};
+
+use super::{auth::Claims, AppState, User};
+
+#[derive(Serialize, Deserialize)]
+pub struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginResponse {
+    token: String,
+}
+
+impl LoginResponse {
+    pub fn new(id: i32, email: String) -> anyhow::Result<Self> {
+        let claims = Claims {
+            sub: id.to_string(),
+            exp: (Utc::now() + Duration::hours(24)).timestamp() as usize,
+            email,
+        };
+
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(env::var("JWT_SECRET").unwrap().as_ref()),
+        )?;
+
+        Ok(Self { token })
+    }
+}
+
+pub async fn register(
+    State(state): State<Arc<AppState>>,
+    Json(user): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, (StatusCode, String)> {
+    let hashed_password = hash(&user.password, 7).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not hash password".to_string(),
+        )
+    })?;
+
+    let id: (i32,) =
+        sqlx::query_as("INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id")
+            .bind(&user.email)
+            .bind(hashed_password)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| {
+                tracing::error!("Could not register user: {}", err);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Could not register user: {err}"),
+                )
+            })?;
+
+    let response = LoginResponse::new(id.0, user.email).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not generate token".to_string(),
+        )
+    })?;
+
+    Ok(Json(response))
+}
+
+pub async fn login(
+    State(state): State<Arc<AppState>>,
+    Json(user): Json<LoginRequest>,
+) -> Result<Json<LoginResponse>, (StatusCode, String)> {
+    let stored_user =
+        sqlx::query_as::<_, User>("SELECT id, email, password_hash FROM users WHERE email = $1")
+            .bind(&user.email)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Database error".to_string(),
+                )
+            })?;
+
+    let stored_user =
+        stored_user.ok_or((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()))?;
+
+    if !verify(&user.password, &stored_user.password_hash).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not verify password".to_string(),
+        )
+    })? {
+        return Err((StatusCode::UNAUTHORIZED, "Invalid credentials".to_string()));
+    }
+
+    let response = LoginResponse::new(stored_user.id, stored_user.email).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not generate token".to_string(),
+        )
+    })?;
+
+    Ok(Json(response))
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/api/login.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/api/settings.rs>>
+use axum::{
+    extract::{Extension, Path, State},
+    http::StatusCode,
+    Json,
+};
+use serde_json::{Map, Value};
+use std::sync::Arc;
+
+use super::AppState;
+
+pub async fn get_settings(
+    State(state): State<Arc<AppState>>,
+    Extension(user_id): Extension<i32>,
+) -> Result<Json<Map<String, Value>>, (StatusCode, String)> {
+    let settings: Vec<(String, Value)> =
+        sqlx::query_as("SELECT key, value FROM settings WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_all(&state.db)
+            .await
+            .map_err(|err| {
+                tracing::error!("Database error: {err}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Database error: {err}"),
+                )
+            })?;
+
+    let mut settings_map = Map::new();
+    for (key, value) in settings {
+        settings_map.insert(key, value);
+    }
+
+    Ok(Json(settings_map))
+}
+
+pub async fn update_setting(
+    State(state): State<Arc<AppState>>,
+    Extension(user_id): Extension<i32>,
+    Path(key): Path<String>,
+    Json(value): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    sqlx::query("INSERT INTO settings (user_id, key, value) VALUES ($1, $2, $3) ON CONFLICT (user_id, key) DO UPDATE SET value = $3")
+        .bind(user_id)
+        .bind(&key)
+        .bind(&value)
+        .execute(&state.db)
+        .await
+        .map_err(|err| {
+            tracing::error!("Database error: {err}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {err}"),
+            )
+        })?;
+
+    Ok(Json(value))
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/api/settings.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/jobs.rs>>
+use apalis::{layers::tracing::TraceLayer, postgres::PostgresStorage, prelude::*};
+use sqlx::{Pool, Postgres};
+use tracing::{debug, info};
+
+use crate::{
+    scan::{self, ScanRequest},
+    utils::truncate_strings,
+};
+
+pub async fn start(pool: Pool<Postgres>) -> anyhow::Result<()> {
+    let pg = PostgresStorage::new(pool);
+    Monitor::<TokioExecutor>::new()
+        .register_with_count(4, {
+            WorkerBuilder::new("scan-worker")
+                .layer(TraceLayer::new())
+                .data(pg.pool().clone())
+                .with_storage(pg)
+                .build_fn(perform_scan)
+        })
+        .on_event(|e| debug!("{e:?}"))
+        .run_with_signal(async {
+            tokio::signal::ctrl_c().await?;
+            info!("Shutting down the system");
+            Ok(())
+        })
+        .await?;
+
+    Ok(())
+}
+
+impl Job for ScanRequest {
+    const NAME: &'static str = "scan-request";
+}
+
+async fn perform_scan(job: ScanRequest, pg: Data<Pool<Postgres>>) {
+    if let Some(job) = serde_json::to_value(&job).ok() {
+        tracing::info!("Processing scan request: {}", truncate_strings(&job));
+    }
+    scan::scan(&pg, &job).await.unwrap();
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/jobs.rs>>
+<<<START_FILE:/Users/fcoury/code/paperiq/server/src/utils.rs>>
+use std::io::Cursor;
+
+use base64::engine::general_purpose;
+use base64::Engine;
+use image::{codecs::jpeg::JpegEncoder, GenericImageView, ImageFormat};
+use serde_json::{Map, Value};
+
+pub fn print_truncated_json(value: &Value) {
+    let truncated = truncate_strings(value);
+    println!("{}", serde_json::to_string_pretty(&truncated).unwrap());
+}
+
+pub fn truncate_strings(value: &Value) -> Value {
+    match value {
+        Value::String(s) => {
+            if s.len() > 100 {
+                Value::String(format!("{}...", &s[..97]))
+            } else {
+                value.clone()
+            }
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(truncate_strings).collect()),
+        Value::Object(obj) => Value::Object(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), truncate_strings(v)))
+                .collect::<Map<String, Value>>(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+pub fn resize_jpg_base64(input_base64: &str) -> anyhow::Result<String> {
+    // Decode the base64 input
+    let input_data = general_purpose::STANDARD.decode(input_base64)?;
+
+    // Create a cursor from the decoded data
+    let cursor = Cursor::new(input_data);
+
+    // Open the image from the cursor
+    let img = image::load(cursor, ImageFormat::Jpeg)?;
+
+    // Get the original dimensions
+    let (width, height) = img.dimensions();
+
+    // Calculate the scaling factor
+    let max_dimension = 1568;
+    let scale = (max_dimension as f32 / width.max(height) as f32).min(1.0);
+
+    // Calculate new dimensions
+    let new_width = (width as f32 * scale) as u32;
+    let new_height = (height as f32 * scale) as u32;
+
+    // Resize the image
+    let resized = img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+
+    // Create a buffer to hold the output
+    let mut output = Vec::new();
+
+    // Encode the image with different quality settings until size requirement is met
+    // let mut quality = 90;
+    let quality = 90;
+    // loop {
+    output.clear();
+    let mut cursor = Cursor::new(&mut output);
+    JpegEncoder::new_with_quality(&mut cursor, quality).encode_image(&resized)?;
+
+    // if output.len() <= 3_932_160 {
+    //     // 3.75MB in bytes
+    //     break;
+    // }
+    //
+    // quality -= 5;
+    // if quality < 1 {
+    //     return Err("Unable to meet size requirement".into());
+    // }
+    // }
+
+    // Encode the output as base64
+    let output_base64 = general_purpose::STANDARD.encode(&output);
+
+    Ok(output_base64)
+}
+
+<<<END_FILE:/Users/fcoury/code/paperiq/server/src/utils.rs>>
