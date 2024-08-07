@@ -1,49 +1,25 @@
-use std::env;
+mod cli;
+
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::PathBuf;
 
+use clap::Parser;
+use cli::Args;
+
 fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    let mut allowed_extensions = Vec::new();
-    let mut include_binary = false;
-    let mut start_path = PathBuf::from(".");
+    let args = Args::parse();
 
-    // Parse command line arguments
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--include-binary" => include_binary = true,
-            "--path" => {
-                if i + 1 < args.len() {
-                    start_path = PathBuf::from(&args[i + 1]);
-                    i += 1;
-                } else {
-                    eprintln!("Error: --path option requires a directory path");
-                    std::process::exit(1);
-                }
-            }
-            arg if !arg.starts_with("--") => allowed_extensions.push(arg.to_lowercase()),
-            _ => {
-                eprintln!("Unknown option: {}", args[i]);
-                std::process::exit(1);
-            }
-        }
-        i += 1;
-    }
-
-    println!("Start path: {:?}", start_path);
-    println!("Allowed extensions: {:?}", allowed_extensions);
-    println!("Include binary files: {}", include_binary);
-
-    let output_file = File::create("concatenated_output.txt")?;
-    let mut writer = io::BufWriter::new(output_file);
+    let mut writer: Box<dyn Write> = match args.output {
+        Some(ref path) => Box::new(BufWriter::new(File::create(path).unwrap())),
+        None => Box::new(BufWriter::new(io::stdout())),
+    };
 
     visit_dirs(
-        &start_path,
+        &args.path.unwrap_or(PathBuf::from(".")),
         &mut writer,
-        &allowed_extensions,
-        include_binary,
+        &args.allowed_extensions,
+        args.include_binary,
     )?;
 
     Ok(())
@@ -51,7 +27,7 @@ fn main() -> io::Result<()> {
 
 fn visit_dirs(
     dir: &PathBuf,
-    writer: &mut io::BufWriter<File>,
+    writer: &mut Box<dyn Write>,
     allowed_extensions: &[String],
     include_binary: bool,
 ) -> io::Result<()> {
@@ -86,7 +62,7 @@ fn should_process_file(file_path: &PathBuf, allowed_extensions: &[String]) -> bo
 
 fn process_file(
     file_path: &PathBuf,
-    writer: &mut io::BufWriter<File>,
+    writer: &mut Box<dyn Write>,
     include_binary: bool,
 ) -> io::Result<()> {
     let mut file = File::open(file_path)?;
@@ -106,14 +82,14 @@ fn process_file(
             &format!("[Binary data encoded as base64]:\n{}", base64),
         )
     } else {
-        eprintln!("Skipping non-UTF8 file: {:?}", file_path);
+        // eprintln!("Skipping non-UTF8 file: {:?}", file_path);
         Ok(())
     }
 }
 
 fn write_file_contents(
     file_path: &PathBuf,
-    writer: &mut io::BufWriter<File>,
+    writer: &mut Box<dyn Write>,
     contents: &str,
 ) -> io::Result<()> {
     let start_marker = format!("<<<START_FILE:{}>>\n", file_path.display());
