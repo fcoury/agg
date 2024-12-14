@@ -15,7 +15,8 @@ fn main() -> io::Result<()> {
     };
 
     let root = args.path.unwrap_or_else(|| PathBuf::from("."));
-    let gitignore = load_gitignore(&root);
+    let gitignore = load_ignore_file(&root, ".gitignore");
+    let aggignore = load_ignore_file(&root, ".aggignore");
 
     visit_dirs(
         &root,
@@ -23,20 +24,24 @@ fn main() -> io::Result<()> {
         &args.allowed_extensions,
         args.include_binary,
         &gitignore,
+        &aggignore,
     )?;
 
     Ok(())
 }
 
-fn load_gitignore(root: &Path) -> Gitignore {
+fn load_ignore_file(root: &Path, filename: &str) -> Gitignore {
     let mut builder = GitignoreBuilder::new(root);
-    let gitignore_path = root.join(".gitignore");
-    eprintln!("Reading .gitignore from {:?}", gitignore_path);
-    if gitignore_path.exists() {
-        _ = builder.add(gitignore_path);
+    let ignore_path = root.join(filename);
+    eprintln!("Reading {} from {:?}", filename, ignore_path);
+    if ignore_path.exists() {
+        match builder.add(ignore_path) {
+            None => (),
+            Some(err) => eprintln!("Error adding {}: {}", filename, err),
+        }
     }
     builder.build().unwrap_or_else(|err| {
-        eprintln!("Error building gitignore: {}", err);
+        eprintln!("Error building {}: {}", filename, err);
         Gitignore::empty()
     })
 }
@@ -47,16 +52,29 @@ fn visit_dirs(
     allowed_extensions: &[String],
     include_binary: bool,
     gitignore: &Gitignore,
+    aggignore: &Gitignore,
 ) -> io::Result<()> {
     if dir.is_dir() {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if gitignore.matched(&path, path.is_dir()).is_ignore() {
+
+            // Check both gitignore and aggignore patterns
+            if gitignore.matched(&path, path.is_dir()).is_ignore()
+                || aggignore.matched(&path, path.is_dir()).is_ignore()
+            {
                 continue; // Skip ignored files/directories
             }
+
             if path.is_dir() {
-                visit_dirs(&path, writer, allowed_extensions, include_binary, gitignore)?;
+                visit_dirs(
+                    &path,
+                    writer,
+                    allowed_extensions,
+                    include_binary,
+                    gitignore,
+                    aggignore,
+                )?;
             } else if should_process_file(&path, allowed_extensions) {
                 match process_file(&path, writer, include_binary) {
                     Ok(_) => (),
@@ -68,7 +86,7 @@ fn visit_dirs(
     Ok(())
 }
 
-fn should_process_file(file_path: &PathBuf, allowed_extensions: &[String]) -> bool {
+fn should_process_file(file_path: &Path, allowed_extensions: &[String]) -> bool {
     if allowed_extensions.is_empty() {
         return true; // Process all files if no extensions are specified
     }
@@ -107,7 +125,7 @@ fn process_file(
 }
 
 fn write_file_contents(
-    file_path: &PathBuf,
+    file_path: &Path,
     writer: &mut Box<dyn Write>,
     contents: &str,
 ) -> io::Result<()> {
