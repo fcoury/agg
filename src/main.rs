@@ -23,6 +23,7 @@ fn main() -> io::Result<()> {
         &mut writer,
         &args.allowed_extensions,
         args.include_binary,
+        &args.exclude_dirs,
         &gitignore,
         &aggignore,
     )?;
@@ -51,6 +52,7 @@ fn visit_dirs(
     writer: &mut Box<dyn Write>,
     allowed_extensions: &[String],
     include_binary: bool,
+    exclude_dirs: &[String],
     gitignore: &Gitignore,
     aggignore: &Gitignore,
 ) -> io::Result<()> {
@@ -58,6 +60,12 @@ fn visit_dirs(
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
+
+            // Check if the directory should be excluded
+            let current_dir = path.file_name().unwrap().to_str().unwrap();
+            if exclude_dirs.contains(&current_dir.to_string()) {
+                continue;
+            }
 
             // Check both gitignore and aggignore patterns
             if gitignore.matched(&path, path.is_dir()).is_ignore()
@@ -72,6 +80,7 @@ fn visit_dirs(
                     writer,
                     allowed_extensions,
                     include_binary,
+                    exclude_dirs,
                     gitignore,
                     aggignore,
                 )?;
