@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 
-#[derive(Parser, Debug)]
+use crate::config::AggConfig;
+
+#[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct Args {
     /// Includes binary files as base64 encoded strings in the output
     #[arg(short = 'b', long)]
@@ -23,4 +26,16 @@ pub struct Args {
     /// List of file extensions to include in the output
     #[clap(last = true)]
     pub allowed_extensions: Vec<String>,
+}
+
+impl From<AggConfig> for Args {
+    fn from(config: AggConfig) -> Self {
+        Args {
+            include_binary: config.include_binary,
+            path: config.path,
+            output: config.output,
+            exclude_dirs: config.exclude_dirs,
+            allowed_extensions: config.allowed_extensions,
+        }
+    }
 }

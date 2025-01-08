@@ -1,14 +1,19 @@
 use clap::Parser;
 use cli::Args;
+use config::AggConfig;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 mod cli;
+mod config;
 
 fn main() -> io::Result<()> {
-    let args = Args::parse();
+    let args = AggConfig::load()
+        .map(Args::from)
+        .unwrap_or_else(Args::parse);
+
     let mut writer: Box<dyn Write> = match args.output {
         Some(ref path) => Box::new(BufWriter::new(File::create(path).unwrap())),
         None => Box::new(BufWriter::new(io::stdout())),
