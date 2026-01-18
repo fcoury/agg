@@ -162,10 +162,12 @@ fn collect_candidates_inner(
 fn build_prompt(goal: &str, candidates: &[FileCandidate], budget: usize) -> String {
     let mut prompt = String::new();
     prompt.push_str("You are selecting project context for an LLM.\n");
-    prompt.push_str("Return JSON only in the form: {\"files\":[{\"path\":\"...\",\"line_ranges\":[{\"start\":1,\"end\":10}]}]}\n");
+    prompt.push_str("Return JSON only (no markdown). Schema:\n");
     prompt.push_str(
-        "Use relative paths from the project root. Choose relevant files and line ranges.\n",
+        "{\"files\":[{\"path\":\"src/main.rs\",\"line_ranges\":[{\"start\":10,\"end\":50}]}]}\n",
     );
+    prompt.push_str("Use empty line_ranges [] to include an entire file.\n");
+    prompt.push_str("Use relative paths. Only select from available files below.\n");
     prompt.push_str(&format!(
         "Goal: {}\nToken budget (soft): {}\n",
         goal, budget
