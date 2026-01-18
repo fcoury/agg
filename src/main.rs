@@ -1,7 +1,7 @@
 use clap::parser::ValueSource;
-use clap::{ArgMatches, CommandFactory, FromArgMatches};
-use cli::Args;
-use config::AggConfig;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser};
+use cli::{Args, Cli, Commands, ConfigAction};
+use config::{AggConfig, GlobalConfig};
 use context::GoalContextArgs;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use llm::LlmConfig;
@@ -15,16 +15,34 @@ mod context;
 mod llm;
 
 fn main() -> io::Result<()> {
-    let matches = Args::command().get_matches();
+    let cli = Cli::parse();
+
+    // Handle subcommands first
+    if let Some(command) = cli.command {
+        return handle_command(command);
+    }
+
+    // Regular aggregation mode
+    let matches = Cli::command().get_matches();
     let cli_args = match Args::from_arg_matches(&matches) {
         Ok(args) => args,
         Err(err) => err.exit(),
     };
-    let mut args = if let Some(config) = AggConfig::load() {
+
+    // Load global config first
+    let global_config = GlobalConfig::load().unwrap_or_default();
+
+    // Load local config and apply global defaults
+    let local_config = AggConfig::load().map(|c| c.with_global_defaults(&global_config));
+
+    // Merge configs with CLI (CLI > local > global)
+    let mut args = if let Some(config) = local_config {
         merge_args(config, cli_args, &matches)
     } else {
-        cli_args
+        // Apply global config directly to CLI args if no local config
+        apply_global_config(cli_args, &global_config, &matches)
     };
+
     if args.llm_debug_log.is_some() {
         args.llm_debug = true;
     }
@@ -55,23 +73,28 @@ fn main() -> io::Result<()> {
     if let Some(goal) = args.goal.as_deref() {
         if llm_config.provider.is_none() && llm_config.command.is_none() {
             eprintln!("Goal-driven mode requires --llm or --llm-cmd");
-        } else {
-            let wrote = context::write_goal_context(GoalContextArgs {
-                root: &root,
-                writer: &mut writer,
-                allowed_extensions: &args.allowed_extensions,
-                include_binary: args.include_binary,
-                exclude_dirs: &args.exclude_dirs,
-                gitignore: &gitignore,
-                aggignore: &aggignore,
-                goal,
-                budget: args.budget,
-                llm_config: &llm_config,
-            })?;
-            if wrote {
-                return Ok(());
-            }
+            eprintln!("Set a default with: agg config set llm <provider>");
+            std::process::exit(1);
         }
+
+        let wrote = context::write_goal_context(GoalContextArgs {
+            root: &root,
+            writer: &mut writer,
+            allowed_extensions: &args.allowed_extensions,
+            include_binary: args.include_binary,
+            exclude_dirs: &args.exclude_dirs,
+            gitignore: &gitignore,
+            aggignore: &aggignore,
+            goal,
+            budget: args.budget,
+            llm_config: &llm_config,
+        })?;
+
+        if !wrote {
+            eprintln!("Goal-driven context generation failed, aborting");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     visit_dirs(
@@ -85,6 +108,90 @@ fn main() -> io::Result<()> {
     )?;
 
     Ok(())
+}
+
+fn handle_command(command: Commands) -> io::Result<()> {
+    match command {
+        Commands::Config { action } => handle_config_action(action),
+    }
+}
+
+fn handle_config_action(action: ConfigAction) -> io::Result<()> {
+    match action {
+        ConfigAction::Set { key, value } => {
+            let mut config = GlobalConfig::load().unwrap_or_default();
+            match config.set(&key, &value) {
+                Ok(()) => {
+                    config.save()?;
+                    println!("Set {} = {}", key, value);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        ConfigAction::Get { key } => {
+            let config = GlobalConfig::load().unwrap_or_default();
+            match config.get(&key) {
+                Some(value) => println!("{}", value),
+                None => {
+                    eprintln!("{} is not set", key);
+                    std::process::exit(1);
+                }
+            }
+        }
+        ConfigAction::List => {
+            let config = GlobalConfig::load().unwrap_or_default();
+            let items = config.list();
+            if items.is_empty() {
+                println!("No configuration values set");
+            } else {
+                for (key, value) in items {
+                    println!("{} = {}", key, value);
+                }
+            }
+        }
+        ConfigAction::Unset { key } => {
+            let mut config = GlobalConfig::load().unwrap_or_default();
+            match config.unset(&key) {
+                Ok(()) => {
+                    config.save()?;
+                    println!("Unset {}", key);
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        ConfigAction::Path => match GlobalConfig::path() {
+            Some(path) => println!("{}", path.display()),
+            None => {
+                eprintln!("Could not determine config path");
+                std::process::exit(1);
+            }
+        },
+    }
+    Ok(())
+}
+
+fn apply_global_config(mut cli: Args, global: &GlobalConfig, matches: &ArgMatches) -> Args {
+    let from_cli = |name: &str| matches.value_source(name) == Some(ValueSource::CommandLine);
+
+    if !from_cli("llm") && cli.llm.is_none() {
+        cli.llm = global.llm.clone();
+    }
+    if !from_cli("llm_cmd") && cli.llm_cmd.is_none() {
+        cli.llm_cmd = global.llm_cmd.clone();
+    }
+    if !from_cli("llm_model") && cli.llm_model.is_none() {
+        cli.llm_model = global.llm_model.clone();
+    }
+    if !from_cli("budget") && cli.budget.is_none() {
+        cli.budget = global.budget;
+    }
+    cli
 }
 
 fn merge_args(config: AggConfig, cli: Args, matches: &ArgMatches) -> Args {

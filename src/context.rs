@@ -349,7 +349,19 @@ fn truncate_content(content: &str, max_tokens: usize) -> String {
     if content.len() <= max_chars {
         return content.to_string();
     }
-    let mut truncated = content[..max_chars].to_string();
+    // Find a safe byte index at a char boundary to avoid slicing inside a UTF-8 codepoint
+    let end_byte = if content.is_char_boundary(max_chars) {
+        max_chars
+    } else {
+        // Scan backwards to find the largest valid char boundary <= max_chars
+        content
+            .char_indices()
+            .rev()
+            .find(|(idx, _)| *idx <= max_chars)
+            .map(|(idx, _)| idx)
+            .unwrap_or(0)
+    };
+    let mut truncated = content[..end_byte].to_string();
     if let Some(last_newline) = truncated.rfind('\n') {
         truncated.truncate(last_newline);
     }
