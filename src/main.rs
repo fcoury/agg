@@ -30,7 +30,13 @@ fn main() -> io::Result<()> {
     };
 
     // Load global config first
-    let global_config = GlobalConfig::load().unwrap_or_default();
+    let global_config = match GlobalConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Warning: {}", e);
+            GlobalConfig::default()
+        }
+    };
 
     // Load local config and apply global defaults
     let local_config = AggConfig::load().map(|c| c.with_global_defaults(&global_config));
@@ -119,7 +125,13 @@ fn handle_command(command: Commands) -> io::Result<()> {
 fn handle_config_action(action: ConfigAction) -> io::Result<()> {
     match action {
         ConfigAction::Set { key, value } => {
-            let mut config = GlobalConfig::load().unwrap_or_default();
+            let mut config = match GlobalConfig::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
             match config.set(&key, &value) {
                 Ok(()) => {
                     config.save()?;
@@ -132,7 +144,13 @@ fn handle_config_action(action: ConfigAction) -> io::Result<()> {
             }
         }
         ConfigAction::Get { key } => {
-            let config = GlobalConfig::load().unwrap_or_default();
+            let config = match GlobalConfig::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
             match config.get(&key) {
                 Some(value) => println!("{}", value),
                 None => {
@@ -142,7 +160,13 @@ fn handle_config_action(action: ConfigAction) -> io::Result<()> {
             }
         }
         ConfigAction::List => {
-            let config = GlobalConfig::load().unwrap_or_default();
+            let config = match GlobalConfig::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
             let items = config.list();
             if items.is_empty() {
                 println!("No configuration values set");
@@ -153,7 +177,13 @@ fn handle_config_action(action: ConfigAction) -> io::Result<()> {
             }
         }
         ConfigAction::Unset { key } => {
-            let mut config = GlobalConfig::load().unwrap_or_default();
+            let mut config = match GlobalConfig::load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            };
             match config.unset(&key) {
                 Ok(()) => {
                     config.save()?;

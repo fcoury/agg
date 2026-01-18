@@ -1,9 +1,51 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-/// Global configuration stored in ~/.config/agg.toml
+/// Error type for global configuration operations
+#[derive(Debug)]
+pub enum ConfigError {
+    /// Could not determine platform-specific config directory
+    PathResolution,
+    /// Error reading the config file
+    Read(io::Error),
+    /// Error parsing TOML content
+    Parse(toml::de::Error),
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConfigError::PathResolution => write!(
+                f,
+                "Could not determine config directory (dirs::config_dir() returned None)"
+            ),
+            ConfigError::Read(e) => write!(f, "Error reading config file: {}", e),
+            ConfigError::Parse(e) => write!(f, "Error parsing config file: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConfigError::PathResolution => None,
+            ConfigError::Read(e) => Some(e),
+            ConfigError::Parse(e) => Some(e),
+        }
+    }
+}
+
+/// Global configuration stored in the platform-specific config directory.
+///
+/// The config file location is determined by `dirs::config_dir()`:
+/// - Linux: `~/.config/agg.toml`
+/// - macOS: `~/Library/Application Support/agg.toml`
+/// - Windows: `%APPDATA%\agg.toml`
+///
+/// Use [`GlobalConfig::path()`] to get the resolved path for the current platform.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GlobalConfig {
     /// Default LLM provider or command name
@@ -17,38 +59,41 @@ pub struct GlobalConfig {
 }
 
 impl GlobalConfig {
-    /// Returns the path to the global config file
+    /// Returns the path to the global config file for the current platform.
+    ///
+    /// Uses `dirs::config_dir()` to determine the platform-specific config directory:
+    /// - Linux: `~/.config/agg.toml`
+    /// - macOS: `~/Library/Application Support/agg.toml`
+    /// - Windows: `%APPDATA%\agg.toml`
+    ///
+    /// Returns `None` if the config directory cannot be determined.
     pub fn path() -> Option<PathBuf> {
         dirs::config_dir().map(|p| p.join("agg.toml"))
     }
 
-    /// Load global config from ~/.config/agg.toml
-    pub fn load() -> Option<Self> {
-        let config_path = Self::path()?;
+    /// Load global config from the platform-specific config directory.
+    ///
+    /// The config file path is determined by [`GlobalConfig::path()`].
+    /// If the file does not exist, returns a default configuration.
+    /// Errors are propagated for path resolution failures, read errors, or parse errors.
+    pub fn load() -> Result<Self, ConfigError> {
+        let config_path = Self::path().ok_or(ConfigError::PathResolution)?;
         if !config_path.exists() {
-            return Some(GlobalConfig::default());
+            return Ok(GlobalConfig::default());
         }
-        match fs::read_to_string(&config_path) {
-            Ok(contents) => match toml::from_str(&contents) {
-                Ok(config) => Some(config),
-                Err(e) => {
-                    eprintln!("Error parsing global config: {}", e);
-                    None
-                }
-            },
-            Err(e) => {
-                eprintln!("Error reading global config: {}", e);
-                None
-            }
-        }
+        let contents = fs::read_to_string(&config_path).map_err(ConfigError::Read)?;
+        toml::from_str(&contents).map_err(ConfigError::Parse)
     }
 
-    /// Save global config to ~/.config/agg.toml
+    /// Save global config to the platform-specific config directory.
+    ///
+    /// The config file path is determined by [`GlobalConfig::path()`].
+    /// Creates the parent directory if it does not exist.
     pub fn save(&self) -> io::Result<()> {
         let config_path = Self::path().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                "Could not determine config directory",
+                "Could not determine config directory (dirs::config_dir() returned None)",
             )
         })?;
 
