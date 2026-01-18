@@ -1,9 +1,54 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use crate::config::AggConfig;
+
+#[derive(Parser, Debug)]
+#[command(name = "agg")]
+#[command(about = "Aggregate files for LLM context")]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+
+    #[command(flatten)]
+    pub args: Args,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    /// Manage global configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigAction {
+    /// Set a configuration value
+    Set {
+        /// Configuration key (llm, llm_cmd, llm_model, budget)
+        key: String,
+        /// Configuration value
+        value: String,
+    },
+    /// Get a configuration value
+    Get {
+        /// Configuration key (llm, llm_cmd, llm_model, budget)
+        key: String,
+    },
+    /// List all configuration values
+    List,
+    /// Remove a configuration value
+    Unset {
+        /// Configuration key to remove
+        key: String,
+    },
+    /// Show the path to the global config file
+    Path,
+}
 
 #[derive(Parser, Debug, Serialize, Deserialize)]
 pub struct Args {
