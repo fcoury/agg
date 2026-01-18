@@ -1,18 +1,39 @@
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches};
 use cli::Args;
 use config::AggConfig;
+use context::GoalContextArgs;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use llm::LlmConfig;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 mod cli;
 mod config;
+mod context;
+mod llm;
 
 fn main() -> io::Result<()> {
-    let args = AggConfig::load()
-        .map(Args::from)
-        .unwrap_or_else(Args::parse);
+    let matches = Args::command().get_matches();
+    let cli_args = match Args::from_arg_matches(&matches) {
+        Ok(args) => args,
+        Err(err) => err.exit(),
+    };
+    let mut args = if let Some(config) = AggConfig::load() {
+        merge_args(config, cli_args, &matches)
+    } else {
+        cli_args
+    };
+    if args.llm_debug_log.is_some() {
+        args.llm_debug = true;
+    }
+
+    if args.debug {
+        eprintln!("Debug mode enabled");
+        eprintln!("Arguments: {:?}", args);
+        return Ok(());
+    }
 
     let mut writer: Box<dyn Write> = match args.output {
         Some(ref path) => Box::new(BufWriter::new(File::create(path).unwrap())),
@@ -22,6 +43,36 @@ fn main() -> io::Result<()> {
     let root = args.path.unwrap_or_else(|| PathBuf::from("."));
     let gitignore = load_ignore_file(&root, ".gitignore");
     let aggignore = load_ignore_file(&root, ".aggignore");
+
+    let llm_config = LlmConfig {
+        provider: args.llm.clone(),
+        command: args.llm_cmd.clone(),
+        model: args.llm_model.clone(),
+        debug: args.llm_debug,
+        debug_log: args.llm_debug_log.clone(),
+    };
+
+    if let Some(goal) = args.goal.as_deref() {
+        if llm_config.provider.is_none() && llm_config.command.is_none() {
+            eprintln!("Goal-driven mode requires --llm or --llm-cmd");
+        } else {
+            let wrote = context::write_goal_context(GoalContextArgs {
+                root: &root,
+                writer: &mut writer,
+                allowed_extensions: &args.allowed_extensions,
+                include_binary: args.include_binary,
+                exclude_dirs: &args.exclude_dirs,
+                gitignore: &gitignore,
+                aggignore: &aggignore,
+                goal,
+                budget: args.budget,
+                llm_config: &llm_config,
+            })?;
+            if wrote {
+                return Ok(());
+            }
+        }
+    }
 
     visit_dirs(
         &root,
@@ -34,6 +85,69 @@ fn main() -> io::Result<()> {
     )?;
 
     Ok(())
+}
+
+fn merge_args(config: AggConfig, cli: Args, matches: &ArgMatches) -> Args {
+    let from_cli = |name: &str| matches.value_source(name) == Some(ValueSource::CommandLine);
+    Args {
+        include_binary: if from_cli("include_binary") {
+            cli.include_binary
+        } else {
+            config.include_binary
+        },
+        path: if from_cli("path") {
+            cli.path
+        } else {
+            config.path
+        },
+        output: if from_cli("output") {
+            cli.output
+        } else {
+            config.output
+        },
+        exclude_dirs: if from_cli("exclude_dirs") {
+            cli.exclude_dirs
+        } else {
+            config.exclude_dirs
+        },
+        debug: cli.debug,
+        goal: if from_cli("goal") {
+            cli.goal
+        } else {
+            config.goal
+        },
+        budget: if from_cli("budget") {
+            cli.budget
+        } else {
+            config.budget
+        },
+        llm: if from_cli("llm") { cli.llm } else { config.llm },
+        llm_cmd: if from_cli("llm_cmd") {
+            cli.llm_cmd
+        } else {
+            config.llm_cmd
+        },
+        llm_model: if from_cli("llm_model") {
+            cli.llm_model
+        } else {
+            config.llm_model
+        },
+        llm_debug: if from_cli("llm_debug") {
+            cli.llm_debug
+        } else {
+            config.llm_debug
+        },
+        llm_debug_log: if from_cli("llm_debug_log") {
+            cli.llm_debug_log
+        } else {
+            config.llm_debug_log
+        },
+        allowed_extensions: if from_cli("allowed_extensions") {
+            cli.allowed_extensions
+        } else {
+            config.allowed_extensions
+        },
+    }
 }
 
 fn load_ignore_file(root: &Path, filename: &str) -> Gitignore {
