@@ -23,6 +23,38 @@ pub struct Args {
     #[arg(short, long)]
     pub exclude_dirs: Vec<String>,
 
+    /// Debug mode, prints the arguments and exits
+    #[arg(short, long)]
+    pub debug: bool,
+
+    /// Goal describing the context to extract
+    #[arg(long)]
+    pub goal: Option<String>,
+
+    /// Soft token budget for goal-driven context
+    #[arg(long)]
+    pub budget: Option<usize>,
+
+    /// LLM provider or command name to invoke
+    #[arg(long)]
+    pub llm: Option<String>,
+
+    /// Custom command template to invoke the LLM
+    #[arg(long)]
+    pub llm_cmd: Option<String>,
+
+    /// Optional model name passed to the LLM command
+    #[arg(long)]
+    pub llm_model: Option<String>,
+
+    /// Print debug output for goal-driven LLM selection
+    #[arg(long)]
+    pub llm_debug: bool,
+
+    /// Write LLM debug output to a log file
+    #[arg(long)]
+    pub llm_debug_log: Option<PathBuf>,
+
     /// List of file extensions to include in the output
     #[clap(last = true)]
     pub allowed_extensions: Vec<String>,
@@ -35,7 +67,15 @@ impl From<AggConfig> for Args {
             path: config.path,
             output: config.output,
             exclude_dirs: config.exclude_dirs,
+            goal: config.goal,
+            budget: config.budget,
+            llm: config.llm,
+            llm_cmd: config.llm_cmd,
+            llm_model: config.llm_model,
+            llm_debug: config.llm_debug,
+            llm_debug_log: config.llm_debug_log,
             allowed_extensions: config.allowed_extensions,
+            debug: false,
         }
     }
 }

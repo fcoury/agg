@@ -11,6 +11,7 @@ A command-line utility for preparing code snippets for AI tools by aggregating s
 - Configurable through command line arguments or `.aggconfig` file
 - Excludes specified directories
 - Outputs to file or stdout
+- Goal-driven context selection with token budgeting
 
 ## Installation
 
@@ -43,6 +44,9 @@ agg -b
 
 # Exclude specific directories
 agg -e node_modules -e target
+
+# Goal-driven context selection with soft budget
+agg --goal "Summarize auth flow" --budget 6000 --llm "claude"
 ```
 
 ### Configuration File
@@ -67,8 +71,17 @@ Options:
   -p, --path <PATH>        Initial path to start searching [default: current directory]
   -o, --output <OUTPUT>    Output file [default: stdout]
   -e, --exclude-dirs <DIRS>    Directories to exclude
+  --goal <GOAL>                Goal describing the context to extract
+  --budget <BUDGET>            Soft token budget for goal-driven context
+  --llm <LLM>                  LLM provider or command name to invoke
+  --llm-cmd <LLM_CMD>          Custom command template to invoke the LLM
+  --llm-model <LLM_MODEL>      Optional model name passed to the LLM command
+  --llm-debug                  Print debug output for goal-driven LLM selection
+  --llm-debug-log <LLM_DEBUG_LOG>  Write LLM debug output to a log file
   [EXTENSIONS]             File extensions to include (space-separated)
 ```
+
+Goal-driven mode passes the prompt to the LLM command via stdin unless you include a `{{prompt}}` placeholder in `--llm-cmd`. The environment variables `AGG_PROMPT` and `AGG_LLM_MODEL` are also set for custom wrappers. Use `--llm-debug-log` to capture LLM selection details without polluting stdout; it automatically enables debug logging.
 
 ## Ignore Files
 

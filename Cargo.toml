@@ -8,4 +8,5 @@ base64 = "0.22.1"
 clap = { version = "4.5", features = ["derive"] }
 ignore = "0.4.22"
 serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
 toml = "0.8.19"

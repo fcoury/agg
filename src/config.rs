@@ -12,6 +12,14 @@ pub struct AggConfig {
     pub exclude_dirs: Vec<String>,
     #[serde(default)]
     pub allowed_extensions: Vec<String>,
+    pub goal: Option<String>,
+    pub budget: Option<usize>,
+    pub llm: Option<String>,
+    pub llm_cmd: Option<String>,
+    pub llm_model: Option<String>,
+    #[serde(default)]
+    pub llm_debug: bool,
+    pub llm_debug_log: Option<PathBuf>,
 }
 
 impl AggConfig {
