@@ -81,27 +81,32 @@ pub fn print_file_list(entries: &[SelectionEntry], budget: usize) {
         format!("{}", budget)
     };
 
-    let header = format!(
+    // Calculate header without ANSI codes for proper width calculation
+    let header_plain = format!("Selected Files ({} / {} tokens)", total_tokens, budget_str);
+    let header_display = format!(
         "Selected Files ({} / {} tokens)",
         style(total_tokens).cyan().bold(),
         budget_str
     );
 
     println!();
-    println!(
-        "╭─ {} {}╮",
-        header,
-        "─".repeat(BOX_WIDTH.saturating_sub(header.len() + 6))
-    );
+    let dashes_needed = BOX_WIDTH.saturating_sub(header_plain.len() + 4);
+    println!("╭─ {} {}╮", header_display, "─".repeat(dashes_needed));
     println!("│{}│", " ".repeat(BOX_WIDTH));
 
     if entries.is_empty() {
-        println!(
-            "│  {}{}│",
-            style("No files selected").dim(),
-            " ".repeat(BOX_WIDTH - 20)
-        );
+        let msg = "No files selected";
+        let padding = BOX_WIDTH.saturating_sub(msg.len() + 2);
+        println!("│  {}{}│", style(msg).dim(), " ".repeat(padding));
     } else {
+        // Column widths (must fit in BOX_WIDTH - 4 for "│  " and "│")
+        // Layout: [marker][idx] [path] [range] [tokens]
+        // Example: " [ 1] ./src/context.rs            L:1-126   1206 tok"
+        let content_width = BOX_WIDTH - 4; // 58 chars available
+        let path_width = 28; // file path
+        let range_width = 14; // line ranges
+        let tok_width = 10; // "1206 tok"
+
         for (i, entry) in entries.iter().enumerate() {
             let range_str = format_line_ranges(&entry.line_ranges)
                 .map(|r| format!("L:{}", r))
@@ -114,26 +119,53 @@ pub fn print_file_list(entries: &[SelectionEntry], budget: usize) {
 
             // Format path - truncate if too long
             let path_str = entry.path.display().to_string();
-            let max_path_len = 32;
-            let display_path = if path_str.len() > max_path_len {
-                format!("...{}", &path_str[path_str.len() - max_path_len + 3..])
+            let display_path = if path_str.len() > path_width {
+                format!("...{}", &path_str[path_str.len() - path_width + 3..])
             } else {
                 path_str
             };
 
-            let line = format!(
-                "{}[{:>2}] {:<35} {:>10} {:>5} tok",
-                source_marker,
-                style(i + 1).dim(),
-                style(&display_path).white(),
-                style(&range_str).dim(),
-                entry.tokens
+            // Truncate range if too long
+            let display_range = if range_str.len() > range_width {
+                format!("{}...", &range_str[..range_width - 3])
+            } else {
+                range_str
+            };
+
+            let tok_str = format!("{} tok", entry.tokens);
+
+            // Build the line with fixed widths (no ANSI in width calc)
+            // Format: marker[idx] path        range      tokens
+            let plain_line = format!(
+                " [{:>2}] {:<path_width$} {:>range_width$} {:>tok_width$}",
+                i + 1,
+                &display_path,
+                &display_range,
+                &tok_str,
+                path_width = path_width,
+                range_width = range_width,
+                tok_width = tok_width,
             );
 
-            // Pad to box width
-            let visible_len = i.to_string().len() + display_path.len() + range_str.len() + 25;
-            let padding = BOX_WIDTH.saturating_sub(visible_len);
-            println!("│  {}{}│", line, " ".repeat(padding));
+            // Now build with colors
+            let colored_line = format!(
+                " [{:>2}] {:<path_width$} {:>range_width$} {:>tok_width$}",
+                style(i + 1).dim(),
+                style(&display_path).white(),
+                style(&display_range).dim(),
+                &tok_str,
+                path_width = path_width,
+                range_width = range_width,
+                tok_width = tok_width,
+            );
+
+            let padding = content_width.saturating_sub(plain_line.len() + 1); // +1 for marker
+            println!(
+                "│ {}{}{}│",
+                source_marker,
+                colored_line,
+                " ".repeat(padding)
+            );
         }
     }
 
@@ -145,7 +177,7 @@ pub fn print_file_list(entries: &[SelectionEntry], budget: usize) {
 pub fn print_commands_bar() {
     println!();
     println!(
-        "  {}dd  {}emove  {}dit  {}oal  {}review  {}ccept  {}uit",
+        "  {} add  {} remove  {} edit  {} goal  {} preview  {} accept  {} quit",
         style("[a]").cyan().bold(),
         style("[r]").cyan().bold(),
         style("[e]").cyan().bold(),
