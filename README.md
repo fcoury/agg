@@ -206,6 +206,93 @@ When using goal-driven selection, output includes metadata about the selection:
 <<<END_CONTEXT>>>
 ```
 
+## Interactive Mode
+
+Interactive mode (`agg -i`) provides a guided, visual interface for building context. It combines LLM-powered file selection with manual editing in a polished terminal UI.
+
+### Features
+
+- **Box-drawn UI** with colored output
+- **Fuzzy file search** - type to filter when adding files
+- **Single-key commands** - no typing required for actions
+- **Progress spinner** during LLM calls
+- **Token counts** per file and total
+- **File preview** with line numbers
+- **LLM auto-detection** - finds installed LLM tools (claude, openai, ollama, etc.)
+
+### Usage
+
+```bash
+# Start interactive mode
+agg -i
+
+# With initial goal and budget
+agg -i --goal "understand the API" --budget 10000
+```
+
+### Workflow
+
+1. **Enter goal** - describe what context you need
+2. **Select LLM** - choose from detected providers or enter custom command
+3. **Set budget** - soft token limit for output
+4. **Review selection** - LLM suggests relevant files
+5. **Refine** - add, remove, or edit files using single-key commands
+6. **Accept** - write output to file or stdout
+
+### Commands
+
+| Key | Action |
+|-----|--------|
+| `a` | Add file (fuzzy search) |
+| `r` | Remove file |
+| `e` | Edit line ranges |
+| `g` | Change goal (re-run LLM) |
+| `p` | Preview file content |
+| `Enter` | Accept and output |
+| `q` / `Esc` | Quit |
+
+### Example Session
+
+```
+╭──────────────────────────────────────────────────────────────╮
+│              agg interactive context builder                  │
+╰──────────────────────────────────────────────────────────────╯
+
+? What's your goal? understand the authentication flow
+
+? Select LLM provider:
+  > claude (detected)
+    opencode (detected)
+    Enter custom command...
+
+? Token budget (0 = unlimited): 8000
+
+? Save as defaults? Yes
++ Saved to .aggconfig
+
+Querying LLM for relevant files...
++ Selected 5 files
+
+╭─ Selected Files (3,200 / 8,000 tokens) ────────────────────╮
+│                                                            │
+│  [1] src/auth/mod.rs           full            450 tokens  │
+│  [2] src/auth/jwt.rs           L:12-89         820 tokens  │
+│  [3] src/middleware/auth.rs    full          1,100 tokens  │
+│  [4] src/routes/login.rs       full            580 tokens  │
+│  [5] src/models/user.rs        L:1-45          250 tokens  │
+│                                                            │
+╰────────────────────────────────────────────────────────────╯
+
+  [a] add  [r] remove  [e] edit  [g] goal  [p] preview  [Enter] accept  [q] quit
+```
+
+### Tips
+
+- **Re-running goal**: When you change the goal (`g`), you're asked whether to keep your manual changes
+- **Line ranges**: Enter ranges like `1-50,100-150` or `full` for the entire file
+- **Pipe detection**: Interactive mode is skipped if stdout is piped (e.g., `agg -i | less`)
+- **Disable colors**: Set `NO_COLOR=1` environment variable
+
 ## Ignore Files
 
 ### .gitignore
