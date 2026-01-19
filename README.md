@@ -13,6 +13,7 @@ A command-line utility for preparing code snippets for AI tools by aggregating s
 - Outputs to file or stdout
 - **Goal-driven context selection**: Use an LLM to intelligently select relevant files and code sections
 - **Token budgeting**: Control output size with soft token limits
+- **Interactive mode**: Guided context building with review and edits
 - **Global configuration**: Set default LLM and budget settings once, use everywhere
 
 ## Installation
@@ -49,6 +50,9 @@ agg -e node_modules -e target
 
 # Goal-driven context selection with soft budget
 agg --goal "Summarize auth flow" --budget 6000 --llm "claude"
+
+# Interactive context builder
+agg --interactive
 ```
 
 ### Configuration File
@@ -63,7 +67,7 @@ exclude_dirs = ["target", "node_modules"]
 allowed_extensions = ["rs", "toml"]
 ```
 
-The program will automatically detect and use the `.aggconfig` file if present. Command line arguments take precedence if both are provided.
+The program will automatically detect and use the `.aggconfig` file if present. If not found, it falls back to the global config. Command line arguments take precedence if both are provided.
 
 ## Command Line Options
 
@@ -79,6 +83,7 @@ Options:
   -o, --output <OUTPUT>            Output file [default: stdout]
   -e, --exclude-dirs <DIRS>        Directories to exclude
   -d, --debug                      Debug mode, prints arguments and exits
+  -i, --interactive                Run interactive context builder
       --goal <GOAL>                Goal describing the context to extract
       --budget <BUDGET>            Soft token budget for goal-driven context
       --llm <LLM>                  LLM provider or command name to invoke
@@ -144,9 +149,9 @@ agg config unset budget
 ```
 
 Config file locations:
-- **Linux**: `~/.config/agg.toml`
-- **macOS**: `~/Library/Application Support/agg.toml`
-- **Windows**: `%APPDATA%\agg.toml`
+- **Linux**: `~/.config/agg/.aggconfig`
+- **macOS**: `~/Library/Application Support/agg/.aggconfig`
+- **Windows**: `%APPDATA%\agg\.aggconfig`
 
 ### Configuration Precedence
 

@@ -72,6 +72,10 @@ pub struct Args {
     #[arg(short, long)]
     pub debug: bool,
 
+    /// Run in interactive context builder mode
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
+
     /// Goal describing the context to extract
     #[arg(long)]
     pub goal: Option<String>,
@@ -119,6 +123,7 @@ impl From<AggConfig> for Args {
             llm_model: config.llm_model,
             llm_debug: config.llm_debug,
             llm_debug_log: config.llm_debug_log,
+            interactive: config.interactive,
             allowed_extensions: config.allowed_extensions,
             debug: false,
         }

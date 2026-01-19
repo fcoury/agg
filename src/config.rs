@@ -41,9 +41,9 @@ impl std::error::Error for ConfigError {
 /// Global configuration stored in the platform-specific config directory.
 ///
 /// The config file location is determined by `dirs::config_dir()`:
-/// - Linux: `~/.config/agg.toml`
-/// - macOS: `~/Library/Application Support/agg.toml`
-/// - Windows: `%APPDATA%\agg.toml`
+/// - Linux: `~/.config/agg/.aggconfig`
+/// - macOS: `~/Library/Application Support/agg/.aggconfig`
+/// - Windows: `%APPDATA%\agg\.aggconfig`
 ///
 /// Use [`GlobalConfig::path()`] to get the resolved path for the current platform.
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -62,13 +62,13 @@ impl GlobalConfig {
     /// Returns the path to the global config file for the current platform.
     ///
     /// Uses `dirs::config_dir()` to determine the platform-specific config directory:
-    /// - Linux: `~/.config/agg.toml`
-    /// - macOS: `~/Library/Application Support/agg.toml`
-    /// - Windows: `%APPDATA%\agg.toml`
+    /// - Linux: `~/.config/agg/.aggconfig`
+    /// - macOS: `~/Library/Application Support/agg/.aggconfig`
+    /// - Windows: `%APPDATA%\agg\.aggconfig`
     ///
     /// Returns `None` if the config directory cannot be determined.
     pub fn path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("agg.toml"))
+        dirs::config_dir().map(|p| p.join("agg").join(".aggconfig"))
     }
 
     /// Load global config from the platform-specific config directory.
@@ -205,11 +205,17 @@ pub struct AggConfig {
     #[serde(default)]
     pub llm_debug: bool,
     pub llm_debug_log: Option<PathBuf>,
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 impl AggConfig {
+    pub fn local_path() -> PathBuf {
+        PathBuf::from(".aggconfig")
+    }
+
     pub fn load() -> Option<Self> {
-        let config_path = PathBuf::from(".aggconfig");
+        let config_path = Self::local_path();
         if config_path.exists() {
             match fs::read_to_string(config_path) {
                 Ok(contents) => match toml::from_str(&contents) {
@@ -229,21 +235,10 @@ impl AggConfig {
         }
     }
 
-    /// Apply global config defaults to local config (local takes precedence)
-    pub fn with_global_defaults(mut self, global: &GlobalConfig) -> Self {
-        if self.llm.is_none() {
-            self.llm = global.llm.clone();
-        }
-        if self.llm_cmd.is_none() {
-            self.llm_cmd = global.llm_cmd.clone();
-        }
-        if self.llm_model.is_none() {
-            self.llm_model = global.llm_model.clone();
-        }
-        if self.budget.is_none() {
-            self.budget = global.budget;
-        }
-        self
+    pub fn save(&self, path: &PathBuf) -> io::Result<()> {
+        let contents = toml::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        fs::write(path, contents)
     }
 }
 
@@ -262,6 +257,7 @@ impl Default for AggConfig {
             llm_model: None,
             llm_debug: false,
             llm_debug_log: None,
+            interactive: false,
         }
     }
 }

@@ -6,12 +6,13 @@ use context::GoalContextArgs;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use llm::LlmConfig;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 mod cli;
 mod config;
 mod context;
+mod interactive;
 mod llm;
 
 fn main() -> io::Result<()> {
@@ -29,24 +30,27 @@ fn main() -> io::Result<()> {
         Err(err) => err.exit(),
     };
 
-    // Load global config first
-    let global_config = match GlobalConfig::load() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("Warning: {}", e);
-            GlobalConfig::default()
+    // Load global config only if no local .aggconfig exists
+    let local_config = AggConfig::load();
+    let global_config = if local_config.is_none() {
+        match GlobalConfig::load() {
+            Ok(config) => Some(config),
+            Err(e) => {
+                eprintln!("Warning: {}", e);
+                Some(GlobalConfig::default())
+            }
         }
+    } else {
+        None
     };
 
-    // Load local config and apply global defaults
-    let local_config = AggConfig::load().map(|c| c.with_global_defaults(&global_config));
-
-    // Merge configs with CLI (CLI > local > global)
+    // Merge configs with CLI (CLI > local > global fallback)
     let mut args = if let Some(config) = local_config {
         merge_args(config, cli_args, &matches)
+    } else if let Some(global) = &global_config {
+        apply_global_config(cli_args, global, &matches)
     } else {
-        // Apply global config directly to CLI args if no local config
-        apply_global_config(cli_args, &global_config, &matches)
+        cli_args
     };
 
     if args.llm_debug_log.is_some() {
@@ -64,9 +68,30 @@ fn main() -> io::Result<()> {
         None => Box::new(BufWriter::new(io::stdout())),
     };
 
-    let root = args.path.unwrap_or_else(|| PathBuf::from("."));
+    let root = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
     let gitignore = load_ignore_file(&root, ".gitignore");
     let aggignore = load_ignore_file(&root, ".aggignore");
+
+    if args.interactive {
+        if !io::stdout().is_terminal() {
+            eprintln!("Warning: stdout is piped, skipping interactive mode");
+            if args.goal.is_none() {
+                eprintln!("Interactive mode requires a terminal");
+                return Ok(());
+            }
+        } else {
+            let wrote = interactive::run_interactive(
+                &mut args,
+                &mut writer,
+                &root,
+                &gitignore,
+                &aggignore,
+            )?;
+            if wrote {
+                return Ok(());
+            }
+        }
+    }
 
     let llm_config = LlmConfig {
         provider: args.llm.clone(),
@@ -248,6 +273,11 @@ fn merge_args(config: AggConfig, cli: Args, matches: &ArgMatches) -> Args {
             config.exclude_dirs
         },
         debug: cli.debug,
+        interactive: if from_cli("interactive") {
+            cli.interactive
+        } else {
+            config.interactive
+        },
         goal: if from_cli("goal") {
             cli.goal
         } else {

@@ -27,10 +27,16 @@ struct LlmFileSelection {
     line_ranges: Vec<LineRange>,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
-struct LineRange {
-    start: usize,
-    end: usize,
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct LineRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SelectedFile {
+    pub path: PathBuf,
+    pub line_ranges: Vec<LineRange>,
 }
 
 pub struct GoalContextArgs<'a> {
@@ -47,37 +53,24 @@ pub struct GoalContextArgs<'a> {
 }
 
 pub fn write_goal_context(args: GoalContextArgs<'_>) -> io::Result<bool> {
-    let candidates = collect_candidates(
-        args.root,
-        args.allowed_extensions,
-        args.exclude_dirs,
-        args.gitignore,
-        args.aggignore,
-    )?;
-    let prompt = build_prompt(
-        args.goal,
-        &candidates,
-        args.budget.unwrap_or(DEFAULT_BUDGET),
-    );
-    let response = match run_llm(&prompt, args.llm_config) {
-        Ok(output) => output,
-        Err(err) => {
-            eprintln!("LLM invocation failed: {}", err);
-            return Ok(false);
-        }
+    let selection = match select_goal_context(GoalContextArgs {
+        root: args.root,
+        writer: args.writer,
+        allowed_extensions: args.allowed_extensions,
+        include_binary: args.include_binary,
+        exclude_dirs: args.exclude_dirs,
+        gitignore: args.gitignore,
+        aggignore: args.aggignore,
+        goal: args.goal,
+        budget: args.budget,
+        llm_config: args.llm_config,
+    })? {
+        Some(selection) => selection,
+        None => return Ok(false),
     };
 
-    let selection = match parse_llm_response(&response) {
-        Some(files) if !files.is_empty() => files,
-        _ => {
-            eprintln!("LLM response was empty or invalid");
-            return Ok(false);
-        }
-    };
-
-    write_context_output(
+    write_selected_context(
         args.writer,
-        args.root,
         args.goal,
         args.budget.unwrap_or(DEFAULT_BUDGET),
         args.llm_config,
@@ -86,6 +79,61 @@ pub fn write_goal_context(args: GoalContextArgs<'_>) -> io::Result<bool> {
     )?;
 
     Ok(true)
+}
+
+pub fn select_goal_context(args: GoalContextArgs<'_>) -> io::Result<Option<Vec<SelectedFile>>> {
+    let candidates = collect_candidates(
+        args.root,
+        args.allowed_extensions,
+        args.exclude_dirs,
+        args.gitignore,
+        args.aggignore,
+    )?;
+    let budget = args.budget.unwrap_or(DEFAULT_BUDGET);
+    let prompt = build_prompt(args.goal, &candidates, budget);
+    let response = match run_llm(&prompt, args.llm_config) {
+        Ok(output) => output,
+        Err(err) => {
+            eprintln!("LLM invocation failed: {}", err);
+            return Ok(None);
+        }
+    };
+
+    let selection = match parse_llm_response(&response) {
+        Some(files) if !files.is_empty() => files,
+        _ => {
+            eprintln!("LLM response was empty or invalid");
+            return Ok(None);
+        }
+    };
+
+    let resolved = selection
+        .into_iter()
+        .filter_map(|file| {
+            resolve_path(args.root, &file.path).map(|path| SelectedFile {
+                path,
+                line_ranges: file.line_ranges,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if resolved.is_empty() {
+        eprintln!("No valid files selected from LLM response");
+        return Ok(None);
+    }
+
+    Ok(Some(resolved))
+}
+
+pub fn write_selected_context(
+    writer: &mut Box<dyn Write>,
+    goal: &str,
+    budget: usize,
+    llm_config: &LlmConfig,
+    include_binary: bool,
+    selection: &[SelectedFile],
+) -> io::Result<()> {
+    write_context_output(writer, goal, budget, llm_config, include_binary, selection)
 }
 
 fn collect_candidates(
@@ -168,9 +216,14 @@ fn build_prompt(goal: &str, candidates: &[FileCandidate], budget: usize) -> Stri
     );
     prompt.push_str("Use empty line_ranges [] to include an entire file.\n");
     prompt.push_str("Use relative paths. Only select from available files below.\n");
+    let budget_label = if budget == 0 {
+        "0 (unlimited)".to_string()
+    } else {
+        budget.to_string()
+    };
     prompt.push_str(&format!(
         "Goal: {}\nToken budget (soft): {}\n",
-        goal, budget
+        goal, budget_label
     ));
     prompt.push_str("Available files:\n");
     for candidate in candidates {
@@ -201,12 +254,11 @@ fn extract_json(text: &str) -> Option<String> {
 
 fn write_context_output(
     writer: &mut Box<dyn Write>,
-    root: &Path,
     goal: &str,
     budget: usize,
     llm_config: &LlmConfig,
     include_binary: bool,
-    selection: &[LlmFileSelection],
+    selection: &[SelectedFile],
 ) -> io::Result<()> {
     let mut tokens_used = 0usize;
     let header = format!(
@@ -218,12 +270,11 @@ fn write_context_output(
     writer.write_all(header.as_bytes())?;
     tokens_used += estimate_tokens(&header);
 
+    let unlimited = budget == 0;
     for file in selection {
-        let Some(path) = resolve_path(root, &file.path) else {
-            continue;
-        };
+        let path = &file.path;
         let Ok((content, lines_attr)) =
-            extract_file_content(&path, &file.line_ranges, include_binary)
+            extract_file_content(path, &file.line_ranges, include_binary)
         else {
             continue;
         };
@@ -234,13 +285,13 @@ fn write_context_output(
         };
         let end_marker = format!("<<<END_FILE:{}>>>\n", display_path);
 
-        if tokens_used >= budget {
+        if !unlimited && tokens_used >= budget {
             break;
         }
 
         let block = format!("{}{}\n{}", start_marker, content, end_marker);
         let block_tokens = estimate_tokens(&block);
-        if tokens_used + block_tokens <= budget {
+        if unlimited || tokens_used + block_tokens <= budget {
             writer.write_all(block.as_bytes())?;
             tokens_used += block_tokens;
             continue;
@@ -269,12 +320,22 @@ fn extract_file_content(
     line_ranges: &[LineRange],
     include_binary: bool,
 ) -> io::Result<(String, Option<String>)> {
+    let content = read_selected_content(path, line_ranges, include_binary)?;
+    let lines_attr = format_line_ranges(line_ranges);
+    Ok((content, lines_attr))
+}
+
+pub fn read_selected_content(
+    path: &Path,
+    line_ranges: &[LineRange],
+    include_binary: bool,
+) -> io::Result<String> {
     let mut file = File::open(path)?;
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
     if let Ok(contents) = String::from_utf8(buffer.clone()) {
         if line_ranges.is_empty() {
-            return Ok((contents, None));
+            return Ok(contents);
         }
         let mut extracted = Vec::new();
         let lines: Vec<&str> = contents.lines().collect();
@@ -289,21 +350,17 @@ fn extract_file_content(
             }
             extracted.push(lines[start..end].join("\n"));
         }
-        let lines_attr = format_line_ranges(line_ranges);
-        Ok((extracted.join("\n\n"), lines_attr))
+        Ok(extracted.join("\n\n"))
     } else if include_binary {
         #[allow(deprecated)]
         let base64 = base64::encode(&buffer);
-        Ok((
-            format!("[Binary data encoded as base64]:\n{}", base64),
-            None,
-        ))
+        Ok(format!("[Binary data encoded as base64]:\n{}", base64))
     } else {
         Err(io::Error::new(io::ErrorKind::InvalidData, "Non-UTF8 file"))
     }
 }
 
-fn format_line_ranges(ranges: &[LineRange]) -> Option<String> {
+pub fn format_line_ranges(ranges: &[LineRange]) -> Option<String> {
     if ranges.is_empty() {
         return None;
     }
@@ -372,7 +429,7 @@ fn sanitize_attr(value: &str) -> String {
     value.replace('"', "'").replace('\n', " ")
 }
 
-fn estimate_tokens(text: &str) -> usize {
+pub fn estimate_tokens(text: &str) -> usize {
     (text.len().saturating_add(3)) / 4
 }
 
